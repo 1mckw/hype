@@ -68,14 +68,6 @@ MAX_WEIGHT_PER_MIN = 900  # per info host; stay under 1200 IP limit
 MM_MEDIAN_ABS_PNL_USD = 5.0
 MM_MIN_CLOSED_TRADES = 100
 MIN_CONSENSUS_ACCOUNTS = 2  # hide symbols with only 1 account
-MIN_SIGNAL_ACCOUNTS = 3       # P0: tradable signal minimum accounts
-MIN_NET_RATIO = 0.60          # P0: dominant side must be >= 60%
-DEFAULT_LIQUID_TOP_N = 50     # P2: top N by 24h notional volume
-MAX_SYMBOL_WEIGHT = 0.30      # P1: max weight per symbol
-MAX_TOTAL_EXPOSURE = 0.80     # P1: max deployed capital per period
-MIN_TOP1_SIGNAL_ACCOUNTS = 5  # P3: top signal must have >= N accounts
-DEFAULT_STOP_LOSS_PCT = 0.015   # P3: -1.5%
-DEFAULT_TAKE_PROFIT_PCT = 0.03  # P3: +3%
 
 
 @dataclass
@@ -813,24 +805,6 @@ def net_ratio(long_n: int, short_n: int, total: int) -> float:
     return max(long_n, short_n) / total
 
 
-def is_tradable_signal(
-    c: ConsensusTarget,
-    min_accounts: int = MIN_SIGNAL_ACCOUNTS,
-    min_net_ratio: float = MIN_NET_RATIO,
-    liquid_coins: set[str] | None = None,
-) -> bool:
-    if c.account_count < min_accounts:
-        return False
-    if c.consensus_direction not in ("Long", "Short"):
-        return False
-    if c.net_ratio < min_net_ratio:
-        return False
-    if liquid_coins is not None and c.coin not in liquid_coins:
-        return False
-    return True
-
-
-_liquid_coins_cache: dict[int, set[str]] = {}
 _mid_prices_cache: dict[str, float] | None = None
 
 
@@ -850,99 +824,6 @@ def fetch_mid_prices(refresh: bool = False) -> dict[str, float]:
                 continue
     _mid_prices_cache = mids
     return mids
-
-
-def fetch_liquid_coin_set(top_n: int = DEFAULT_LIQUID_TOP_N) -> set[str]:
-    if top_n in _liquid_coins_cache:
-        return _liquid_coins_cache[top_n]
-    raw = post_info({"type": "metaAndAssetCtxs"})
-    coins: set[str] = set()
-    if isinstance(raw, list) and len(raw) >= 2:
-        meta, ctxs = raw[0], raw[1]
-        ranked: list[tuple[str, float]] = []
-        for i, asset in enumerate(meta.get("universe", [])):
-            name = str(asset.get("name", ""))
-            if not name or i >= len(ctxs):
-                continue
-            vol = float(ctxs[i].get("dayNtlVlm", 0) or 0)
-            ranked.append((name, vol))
-        ranked.sort(key=lambda x: x[1], reverse=True)
-        coins = {name for name, _ in ranked[:top_n]}
-    _liquid_coins_cache[top_n] = coins
-    return coins
-
-
-def filter_tradable_consensus(
-    consensus: list[ConsensusTarget],
-    top_n: int,
-    liquid_coins: set[str] | None = None,
-    min_top1_accounts: int = MIN_TOP1_SIGNAL_ACCOUNTS,
-) -> list[ConsensusTarget]:
-    items = [c for c in consensus if is_tradable_signal(c, liquid_coins=liquid_coins)]
-    if not items:
-        return []
-    if items[0].account_count < min_top1_accounts:
-        return []
-    return items[:top_n]
-
-
-def signal_side_wr(c: ConsensusTarget) -> float:
-    if c.consensus_direction == "Long":
-        return c.avg_long_wr
-    if c.consensus_direction == "Short":
-        return c.avg_short_wr
-    return 0.0
-
-
-def compute_wr_weights(
-    signals: list[ConsensusTarget],
-    max_symbol_weight: float = MAX_SYMBOL_WEIGHT,
-    max_total_exposure: float = MAX_TOTAL_EXPOSURE,
-) -> dict[str, float]:
-    """P1: weight ∝ account_count × side win-rate, with exposure caps."""
-    raw: dict[str, float] = {}
-    for s in signals:
-        side_wr = max(signal_side_wr(s), 0.01)
-        raw[s.coin] = s.account_count * side_wr
-    total_raw = sum(raw.values())
-    if total_raw <= 0:
-        return {}
-
-    weights = {coin: v / total_raw for coin, v in raw.items()}
-    capped = {coin: min(w, max_symbol_weight) for coin, w in weights.items()}
-    cap_sum = sum(capped.values())
-    if cap_sum <= 0:
-        return {}
-    if cap_sum > max_total_exposure:
-        scale = max_total_exposure / cap_sum
-        return {coin: w * scale for coin, w in capped.items()}
-    return capped
-
-
-def leg_return_with_stops(
-    bar: dict[str, float],
-    direction: str,
-    entry_px: float,
-    stop_pct: float,
-    tp_pct: float,
-) -> tuple[float, float, str]:
-    """P3: intrabar stop-loss / take-profit, conservative (stop checked first)."""
-    low, high, close = bar["low"], bar["high"], bar["close"]
-    if direction == "Long":
-        stop_px = entry_px * (1 - stop_pct)
-        tp_px = entry_px * (1 + tp_pct)
-        if low <= stop_px:
-            return (stop_px - entry_px) / entry_px, stop_px, "stop"
-        if high >= tp_px:
-            return (tp_px - entry_px) / entry_px, tp_px, "tp"
-        return (close - entry_px) / entry_px, close, "close"
-    stop_px = entry_px * (1 + stop_pct)
-    tp_px = entry_px * (1 - tp_pct)
-    if high >= stop_px:
-        return (entry_px - stop_px) / entry_px, stop_px, "stop"
-    if low <= tp_px:
-        return (entry_px - tp_px) / entry_px, tp_px, "tp"
-    return (entry_px - close) / entry_px, close, "close"
 
 
 def _avg_wr_by_side(addr_wr: dict[str, float]) -> float:
@@ -2898,15 +2779,6 @@ def write_summary_txt(
             f"(trailing 365D if history>=365d, else since account inception)\n"
         )
         fh.write("Filter: all-time PnL > 0 (leaderboard allTime)\n")
-        fh.write(f"Signal: net ratio >= {MIN_NET_RATIO:.0%}, accounts >= {MIN_SIGNAL_ACCOUNTS}\n")
-        fh.write(
-            f"P1: WR-weighted sizing, max {MAX_SYMBOL_WEIGHT:.0%}/symbol, "
-            f"{MAX_TOTAL_EXPOSURE:.0%} total exposure\n"
-        )
-        fh.write(
-            f"P3: top1>={MIN_TOP1_SIGNAL_ACCOUNTS} accounts, "
-            f"SL -{DEFAULT_STOP_LOSS_PCT:.1%}, TP +{DEFAULT_TAKE_PROFIT_PCT:.1%}\n"
-        )
         fh.write(f"Consensus: min {MIN_CONSENSUS_ACCOUNTS} accounts per symbol\n")
         fh.write(
             f"Exclude MM: median(|closedPnl|) < ${MM_MEDIAN_ABS_PNL_USD:g}"
