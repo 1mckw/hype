@@ -129,6 +129,15 @@ def _short_addr(address: str) -> str:
     return f"{address[:6]}...{address[-4:]}"
 
 
+def format_no_new_trades_message(*, account_total: int, tracked: int) -> str:
+    return "\n".join([
+        "✅ 掃描完成 · 無新開倉",
+        f"時間: {utc_str(utc_now_ms())}",
+        f"監控帳號: {account_total}",
+        f"追蹤倉位: {tracked}",
+    ])
+
+
 def format_new_trades_message(records: list[OpenRecord], *, account_total: int) -> str:
     lines = [
         f"🆕 新成交 · {len(records)} 筆",
@@ -206,6 +215,9 @@ def watch_new_trades(
 
     if not alerts:
         print("  No new trades")
+        msg = format_no_new_trades_message(account_total=total, tracked=len(current))
+        send_telegram_message(msg, token, chat_id)
+        print("  Sent no-new-trades summary")
         return 0
 
     msg = format_new_trades_message(alerts, account_total=total)
