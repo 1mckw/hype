@@ -17,7 +17,9 @@ from fetch_top_traders import (
     FILLS_CACHE_FILE,
     FILLS_CACHE_TTL_SEC,
     MIN_YEAR_ROI,
+    ConsensusTarget,
     OpenRecord,
+    build_consensus,
     build_info_url_config,
     configure_fills_cache,
     configure_info_urls,
@@ -34,6 +36,7 @@ from fetch_top_traders import (
 STATE_FILE = "telegram_state.json"
 POLL_INTERVAL_SEC = 30 * 60
 MAX_ALERTS = 25
+TOP_N = 5
 
 
 def run_trade_scan(
@@ -45,7 +48,7 @@ def run_trade_scan(
     workers: int = 24,
     fast: bool = True,
     use_cache: bool = True,
-) -> tuple[list[OpenRecord], list[OpenRecord], int]:
+) -> tuple[list[OpenRecord], list[OpenRecord], int, list[ConsensusTarget], list[ConsensusTarget]]:
     os.makedirs(output_dir, exist_ok=True)
     rows = fetch_leaderboard(output_dir, use_cache=use_cache)
     qualified = select_top_traders(
@@ -59,7 +62,14 @@ def run_trade_scan(
     if not qualified:
         raise RuntimeError("No qualified traders found")
     records_4h, records_24h = records_from_qualified(qualified)
-    return records_4h, records_24h, len(qualified)
+    total = len(qualified)
+    return (
+        records_4h,
+        records_24h,
+        total,
+        build_consensus(records_4h, "4H", total),
+        build_consensus(records_24h, "24H", total),
+    )
 
 
 def trade_key(record: OpenRecord) -> str:
@@ -129,16 +139,56 @@ def _short_addr(address: str) -> str:
     return f"{address[:6]}...{address[-4:]}"
 
 
-def format_no_new_trades_message(*, account_total: int, tracked: int) -> str:
+def format_consensus_top5(
+    consensus_4h: list[ConsensusTarget],
+    consensus_24h: list[ConsensusTarget],
+    *,
+    top_n: int = TOP_N,
+) -> str:
+    sections: list[str] = []
+
+    def block(window: str, items: list[ConsensusTarget]) -> None:
+        lines = [f"📊 共識 TOP{top_n} · {window}"]
+        if not items:
+            lines.append("無共識標的")
+        else:
+            for i, c in enumerate(items[:top_n], start=1):
+                direction = format_direction_zh(c.consensus_direction)
+                lines.append(
+                    f"{i}. <b>{c.coin}</b> · {direction} · 淨比例 <b>{c.net_ratio:.0%}</b> "
+                    f"({c.long_accounts}多/{c.short_accounts}空 · {c.account_count}帳號)"
+                )
+        sections.append("\n".join(lines))
+
+    block("4H", consensus_4h)
+    block("24H", consensus_24h)
+    return "\n\n".join(sections)
+
+
+def format_no_new_trades_message(
+    *,
+    account_total: int,
+    tracked: int,
+    consensus_4h: list[ConsensusTarget],
+    consensus_24h: list[ConsensusTarget],
+) -> str:
     return "\n".join([
         "✅ 掃描完成 · 無新開倉",
         f"時間: {utc_str(utc_now_ms())}",
         f"監控帳號: {account_total}",
         f"追蹤倉位: {tracked}",
+        "",
+        format_consensus_top5(consensus_4h, consensus_24h),
     ])
 
 
-def format_new_trades_message(records: list[OpenRecord], *, account_total: int) -> str:
+def format_new_trades_message(
+    records: list[OpenRecord],
+    *,
+    account_total: int,
+    consensus_4h: list[ConsensusTarget],
+    consensus_24h: list[ConsensusTarget],
+) -> str:
     lines = [
         f"🆕 新成交 · {len(records)} 筆",
         f"時間: {utc_str(utc_now_ms())}",
@@ -158,6 +208,7 @@ def format_new_trades_message(records: list[OpenRecord], *, account_total: int) 
             lines.append(f"   {name}")
     if len(records) > MAX_ALERTS:
         lines.append(f"\n…另有 {len(records) - MAX_ALERTS} 筆")
+    lines.extend(["", format_consensus_top5(consensus_4h, consensus_24h)])
     return "\n".join(lines)
 
 
@@ -195,7 +246,9 @@ def watch_new_trades(
 ) -> int:
     print("Running trade scan...")
     t0 = time.time()
-    records_4h, records_24h, total = run_trade_scan(output_dir, **scan_kwargs)
+    records_4h, records_24h, total, consensus_4h, consensus_24h = run_trade_scan(
+        output_dir, **scan_kwargs,
+    )
     current = merge_records(records_4h, records_24h)
     state = load_trade_state(output_dir)
     if force_bootstrap:
@@ -215,12 +268,22 @@ def watch_new_trades(
 
     if not alerts:
         print("  No new trades")
-        msg = format_no_new_trades_message(account_total=total, tracked=len(current))
+        msg = format_no_new_trades_message(
+            account_total=total,
+            tracked=len(current),
+            consensus_4h=consensus_4h,
+            consensus_24h=consensus_24h,
+        )
         send_telegram_message(msg, token, chat_id)
         print("  Sent no-new-trades summary")
         return 0
 
-    msg = format_new_trades_message(alerts, account_total=total)
+    msg = format_new_trades_message(
+        alerts,
+        account_total=total,
+        consensus_4h=consensus_4h,
+        consensus_24h=consensus_24h,
+    )
     send_telegram_message(msg, token, chat_id)
     print(f"  Sent {len(alerts)} new trade alert(s)")
     return len(alerts)
@@ -273,11 +336,6 @@ def main() -> int:
 
     if args.gha:
         args.workers = min(args.workers, 8)
-        # Lighter scan on GHA: trade alerts don't need the full 300-account deep scan.
-        if args.count == 300:
-            args.count = 150
-        if args.scan_limit == 2000:
-            args.scan_limit = 600
 
     info_urls, info_auth = build_info_url_config(args.info_urls, args.goldrush_key or None)
     configure_info_urls(info_urls, info_auth)
