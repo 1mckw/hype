@@ -10,24 +10,26 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from typing import Any
+
+from dataclasses import dataclass
 
 from fetch_top_traders import (
     FILLS_CACHE_FILE,
     FILLS_CACHE_TTL_SEC,
+    MIN_CONSENSUS_ACCOUNTS,
     MIN_YEAR_ROI,
-    ConsensusTarget,
     OpenRecord,
-    build_consensus,
     build_info_url_config,
     configure_fills_cache,
     configure_info_urls,
     configure_min_year_roi,
     configure_wr_days,
+    direction_side,
     fetch_leaderboard,
     format_direction_zh,
-    records_from_qualified,
+    net_ratio,
+    records_from_qualified_minutes,
     select_top_traders,
     utc_now_ms,
     utc_str,
@@ -35,8 +37,23 @@ from fetch_top_traders import (
 
 STATE_FILE = "telegram_state.json"
 POLL_INTERVAL_SEC = 30 * 60
+ALERT_WINDOW_MIN = 30
 MAX_ALERTS = 25
 TOP_N = 5
+
+
+@dataclass
+class TelegramCoinConsensus:
+    coin: str
+    account_count: int
+    long_accounts: int
+    short_accounts: int
+    net_ratio: float
+    consensus_direction: str
+    open_long: int
+    open_short: int
+    close_long: int
+    close_short: int
 
 
 def run_trade_scan(
@@ -48,7 +65,7 @@ def run_trade_scan(
     workers: int = 24,
     fast: bool = True,
     use_cache: bool = True,
-) -> tuple[list[OpenRecord], list[OpenRecord], int, list[ConsensusTarget], list[ConsensusTarget]]:
+) -> tuple[list[OpenRecord], int, list[TelegramCoinConsensus]]:
     os.makedirs(output_dir, exist_ok=True)
     rows = fetch_leaderboard(output_dir, use_cache=use_cache)
     qualified = select_top_traders(
@@ -61,24 +78,95 @@ def run_trade_scan(
     )
     if not qualified:
         raise RuntimeError("No qualified traders found")
-    records_4h, records_24h = records_from_qualified(qualified)
-    total = len(qualified)
-    return (
-        records_4h,
-        records_24h,
-        total,
-        build_consensus(records_4h, "4H", total),
-        build_consensus(records_24h, "24H", total),
+    records_30m = records_from_qualified_minutes(
+        qualified, ALERT_WINDOW_MIN, window="30M",
     )
+    total = len(qualified)
+    return records_30m, total, build_telegram_consensus(records_30m, total)
+
+
+def build_telegram_consensus(
+    records: list[OpenRecord],
+    total_accounts: int,
+) -> list[TelegramCoinConsensus]:
+    by_coin: dict[str, dict[str, set[str]]] = {}
+
+    for record in records:
+        coin = record.coin
+        bucket = by_coin.get(coin)
+        if bucket is None:
+            bucket = {
+                "open_long": set(),
+                "open_short": set(),
+                "close_long": set(),
+                "close_short": set(),
+                "long": set(),
+                "short": set(),
+            }
+            by_coin[coin] = bucket
+
+        dir_zh = format_direction_zh(record.direction)
+        if dir_zh == "開多":
+            bucket["open_long"].add(record.address)
+        elif dir_zh == "開空":
+            bucket["open_short"].add(record.address)
+        elif dir_zh == "平多":
+            bucket["close_long"].add(record.address)
+        elif dir_zh == "平空":
+            bucket["close_short"].add(record.address)
+
+        side = direction_side(record.direction)
+        if side == "Long":
+            bucket["long"].add(record.address)
+        elif side == "Short":
+            bucket["short"].add(record.address)
+
+    results: list[TelegramCoinConsensus] = []
+    for coin, bucket in by_coin.items():
+        long_n = len(bucket["long"])
+        short_n = len(bucket["short"])
+        account_count = len(bucket["long"] | bucket["short"])
+        if account_count < MIN_CONSENSUS_ACCOUNTS:
+            continue
+
+        if long_n > short_n:
+            direction = "Long"
+        elif short_n > long_n:
+            direction = "Short"
+        elif long_n > 0:
+            direction = "Mixed"
+        else:
+            direction = "—"
+
+        results.append(
+            TelegramCoinConsensus(
+                coin=coin,
+                account_count=account_count,
+                long_accounts=long_n,
+                short_accounts=short_n,
+                net_ratio=net_ratio(long_n, short_n, account_count),
+                consensus_direction=direction,
+                open_long=len(bucket["open_long"]),
+                open_short=len(bucket["open_short"]),
+                close_long=len(bucket["close_long"]),
+                close_short=len(bucket["close_short"]),
+            )
+        )
+
+    results.sort(
+        key=lambda item: (item.account_count, item.open_long + item.close_long + item.open_short + item.close_short),
+        reverse=True,
+    )
+    return results
 
 
 def trade_key(record: OpenRecord) -> str:
     return f"{record.address.lower()}|{record.coin}|{record.direction}|{record.open_ts}"
 
 
-def merge_records(records_4h: list[OpenRecord], records_24h: list[OpenRecord]) -> dict[str, OpenRecord]:
+def merge_records(records: list[OpenRecord]) -> dict[str, OpenRecord]:
     merged: dict[str, OpenRecord] = {}
-    for record in records_4h + records_24h:
+    for record in records:
         key = trade_key(record)
         prev = merged.get(key)
         if prev is None or record.fill_count > prev.fill_count:
@@ -140,45 +228,40 @@ def _short_addr(address: str) -> str:
 
 
 def format_consensus_top5(
-    consensus_4h: list[ConsensusTarget],
-    consensus_24h: list[ConsensusTarget],
+    consensus: list[TelegramCoinConsensus],
     *,
     top_n: int = TOP_N,
 ) -> str:
-    sections: list[str] = []
+    lines = [f"📊 共識 TOP{top_n} · 30M"]
+    if not consensus:
+        lines.append("無共識標的")
+        return "\n".join(lines)
 
-    def block(window: str, items: list[ConsensusTarget]) -> None:
-        lines = [f"📊 共識 TOP{top_n} · {window}"]
-        if not items:
-            lines.append("無共識標的")
-        else:
-            for i, c in enumerate(items[:top_n], start=1):
-                direction = format_direction_zh(c.consensus_direction)
-                lines.append(
-                    f"{i}. <b>{c.coin}</b> · {direction} · 淨比例 <b>{c.net_ratio:.0%}</b> "
-                    f"({c.long_accounts}多/{c.short_accounts}空 · {c.account_count}帳號)"
-                )
-        sections.append("\n".join(lines))
-
-    block("4H", consensus_4h)
-    block("24H", consensus_24h)
-    return "\n\n".join(sections)
+    for i, item in enumerate(consensus[:top_n], start=1):
+        direction = format_direction_zh(item.consensus_direction)
+        lines.append(
+            f"{i}. <b>{item.coin}</b> · {direction} · 淨比例 <b>{item.net_ratio:.0%}</b>"
+        )
+        lines.append(
+            f"   開多{item.open_long} · 開空{item.open_short} · "
+            f"平多{item.close_long} · 平空{item.close_short} · {item.account_count}帳號"
+        )
+    return "\n".join(lines)
 
 
 def format_no_new_trades_message(
     *,
     account_total: int,
     tracked: int,
-    consensus_4h: list[ConsensusTarget],
-    consensus_24h: list[ConsensusTarget],
+    consensus: list[TelegramCoinConsensus],
 ) -> str:
     return "\n".join([
-        "✅ 掃描完成 · 無新開倉",
+        f"✅ 掃描完成 · 無新成交（{ALERT_WINDOW_MIN}M）",
         f"時間: {utc_str(utc_now_ms())}",
         f"監控帳號: {account_total}",
-        f"追蹤倉位: {tracked}",
+        f"追蹤成交: {tracked}",
         "",
-        format_consensus_top5(consensus_4h, consensus_24h),
+        format_consensus_top5(consensus),
     ])
 
 
@@ -186,11 +269,10 @@ def format_new_trades_message(
     records: list[OpenRecord],
     *,
     account_total: int,
-    consensus_4h: list[ConsensusTarget],
-    consensus_24h: list[ConsensusTarget],
+    consensus: list[TelegramCoinConsensus],
 ) -> str:
     lines = [
-        f"🆕 新成交 · {len(records)} 筆",
+        f"🆕 新成交 · {len(records)} 筆（{ALERT_WINDOW_MIN}M）",
         f"時間: {utc_str(utc_now_ms())}",
         f"監控帳號: {account_total}",
         "",
@@ -208,7 +290,7 @@ def format_new_trades_message(
             lines.append(f"   {name}")
     if len(records) > MAX_ALERTS:
         lines.append(f"\n…另有 {len(records) - MAX_ALERTS} 筆")
-    lines.extend(["", format_consensus_top5(consensus_4h, consensus_24h)])
+    lines.extend(["", format_consensus_top5(consensus)])
     return "\n".join(lines)
 
 
@@ -246,10 +328,8 @@ def watch_new_trades(
 ) -> int:
     print("Running trade scan...")
     t0 = time.time()
-    records_4h, records_24h, total, consensus_4h, consensus_24h = run_trade_scan(
-        output_dir, **scan_kwargs,
-    )
-    current = merge_records(records_4h, records_24h)
+    records_30m, total, consensus = run_trade_scan(output_dir, **scan_kwargs)
+    current = merge_records(records_30m)
     state = load_trade_state(output_dir)
     if force_bootstrap:
         state = {"initialized": False, "trades": {}}
@@ -271,8 +351,7 @@ def watch_new_trades(
         msg = format_no_new_trades_message(
             account_total=total,
             tracked=len(current),
-            consensus_4h=consensus_4h,
-            consensus_24h=consensus_24h,
+            consensus=consensus,
         )
         send_telegram_message(msg, token, chat_id)
         print("  Sent no-new-trades summary")
@@ -281,8 +360,7 @@ def watch_new_trades(
     msg = format_new_trades_message(
         alerts,
         account_total=total,
-        consensus_4h=consensus_4h,
-        consensus_24h=consensus_24h,
+        consensus=consensus,
     )
     send_telegram_message(msg, token, chat_id)
     print(f"  Sent {len(alerts)} new trade alert(s)")

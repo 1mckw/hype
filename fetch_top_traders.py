@@ -43,6 +43,7 @@ MIN_FILLS_7D = 3             # must have >=3 fills in last 7d
 MIN_HISTORY_DAYS = 30          # account must be open at least 30 days
 
 HOUR_MS = 3_600_000
+MINUTE_MS = 60_000
 DAY_MS = 24 * HOUR_MS
 YEAR_MS = 365 * DAY_MS
 
@@ -534,6 +535,11 @@ def is_suspected_market_maker(
 
 def filter_fills_by_hours(fills: list[dict[str, Any]], hours: int) -> list[dict[str, Any]]:
     cutoff = utc_now_ms() - hours * HOUR_MS
+    return [f for f in fills if int(f.get("time", 0) or 0) >= cutoff]
+
+
+def filter_fills_by_minutes(fills: list[dict[str, Any]], minutes: int) -> list[dict[str, Any]]:
+    cutoff = utc_now_ms() - minutes * MINUTE_MS
     return [f for f in fills if int(f.get("time", 0) or 0) >= cutoff]
 
 
@@ -1048,6 +1054,21 @@ def records_from_qualified(qualified: list[TraderFills]) -> tuple[list[OpenRecor
         records_4h.extend(summarize_opens(trader, rank, "4H", filter_fills_by_hours(item.fills, 4)))
         records_24h.extend(summarize_opens(trader, rank, "24H", filter_fills_by_hours(item.fills, 24)))
     return records_4h, records_24h
+
+
+def records_from_qualified_minutes(
+    qualified: list[TraderFills],
+    minutes: int,
+    *,
+    window: str = "30M",
+) -> list[OpenRecord]:
+    records: list[OpenRecord] = []
+    for rank, item in enumerate(qualified, start=1):
+        trader = item.trader
+        records.extend(
+            summarize_opens(trader, rank, window, filter_fills_by_minutes(item.fills, minutes))
+        )
+    return records
 
 
 def write_accounts_csv(path: str, qualified: list[TraderFills]) -> None:
