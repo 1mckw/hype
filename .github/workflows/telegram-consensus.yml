@@ -2,8 +2,8 @@ name: Telegram Trade Alerts
 
 on:
   schedule:
-    # Poll every 15 minutes for new trades
-    - cron: "*/15 * * * *"
+    # Poll every 30 minutes for new trades
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 concurrency:

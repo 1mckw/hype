@@ -32,7 +32,7 @@ from fetch_top_traders import (
 )
 
 STATE_FILE = "telegram_state.json"
-POLL_INTERVAL_SEC = 15 * 60
+POLL_INTERVAL_SEC = 30 * 60
 MAX_ALERTS = 25
 
 
@@ -238,7 +238,7 @@ def main() -> int:
     parser.add_argument("--output-dir", default=os.environ.get("TELEGRAM_OUTPUT_DIR", "output"))
     parser.add_argument("--once", action="store_true", help="Scan once and exit")
     parser.add_argument("--gha", action="store_true", help="GitHub Actions mode (same as --once)")
-    parser.add_argument("--loop", action="store_true", help="Poll forever (default interval 15 min)")
+    parser.add_argument("--loop", action="store_true", help="Poll forever (default interval 30 min)")
     parser.add_argument("--interval-min", type=int, default=POLL_INTERVAL_SEC // 60)
     parser.add_argument("--bootstrap", action="store_true", help="Reset state without sending alerts")
     parser.add_argument("--count", type=int, default=300)
