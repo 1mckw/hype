@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+
+output/
+output_bench/
+output_bench2/
+output_test/
+
+*.log

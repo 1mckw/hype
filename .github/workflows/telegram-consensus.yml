@@ -1,0 +1,40 @@
+name: Telegram Consensus
+
+on:
+  schedule:
+    # Every 4 hours UTC: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: telegram-consensus
+  cancel-in-progress: true
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore API caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            output/leaderboard_cache.json
+            output/fills_cache.json
+          key: hl-cache-${{ github.run_id }}
+          restore-keys: |
+            hl-cache-
+
+      - name: Run scan and push Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOLDRUSH_API_KEY: ${{ secrets.GOLDRUSH_API_KEY }}
+        run: python telegram_bot.py --gha --output-dir output --workers 8
