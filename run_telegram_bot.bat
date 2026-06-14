@@ -31,12 +31,12 @@ if "%TELEGRAM_CHAT_ID%"=="" (
 
 if not exist "output" mkdir "output"
 
-echo Schedule: 4H TOP5 every 4H UTC, 24H TOP5 at 00:00 UTC
-echo Optional: add --boot-notify to push immediately on start
+echo Schedule: poll every 15 min for new trades (GitHub Actions)
 echo Test once: python telegram_bot.py --once
+echo Reset baseline: python telegram_bot.py --bootstrap
 echo.
 
-python "%~dp0telegram_bot.py" --loop --boot-notify --output-dir "%~dp0output"
+python "%~dp0telegram_bot.py" --loop --interval-min 15 --output-dir "%~dp0output"
 set EXITCODE=%ERRORLEVEL%
 
 echo.
