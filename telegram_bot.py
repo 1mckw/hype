@@ -273,6 +273,11 @@ def main() -> int:
 
     if args.gha:
         args.workers = min(args.workers, 8)
+        # Lighter scan on GHA: trade alerts don't need the full 300-account deep scan.
+        if args.count == 300:
+            args.count = 150
+        if args.scan_limit == 2000:
+            args.scan_limit = 600
 
     info_urls, info_auth = build_info_url_config(args.info_urls, args.goldrush_key or None)
     configure_info_urls(info_urls, info_auth)
