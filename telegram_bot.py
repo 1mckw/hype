@@ -29,6 +29,7 @@ from fetch_top_traders import (
     fetch_leaderboard,
     format_direction_zh,
     net_ratio,
+    records_from_qualified,
     records_from_qualified_minutes,
     select_top_traders,
     utc_now_ms,
@@ -40,6 +41,8 @@ POLL_INTERVAL_SEC = 30 * 60
 ALERT_WINDOW_MIN = 30
 MAX_ALERTS = 25
 TOP_N = 5
+BUCKET_4H_MS = 4 * 3_600_000
+BUCKET_24H_MS = 24 * 3_600_000
 
 
 @dataclass
@@ -65,7 +68,7 @@ def run_trade_scan(
     workers: int = 24,
     fast: bool = True,
     use_cache: bool = True,
-) -> tuple[list[OpenRecord], int, list[TelegramCoinConsensus]]:
+) -> tuple[list[OpenRecord], int, list[TelegramCoinConsensus], list[TelegramCoinConsensus]]:
     os.makedirs(output_dir, exist_ok=True)
     rows = fetch_leaderboard(output_dir, use_cache=use_cache)
     qualified = select_top_traders(
@@ -81,8 +84,14 @@ def run_trade_scan(
     records_30m = records_from_qualified_minutes(
         qualified, ALERT_WINDOW_MIN, window="30M",
     )
+    records_4h, records_24h = records_from_qualified(qualified)
     total = len(qualified)
-    return records_30m, total, build_telegram_consensus(records_30m, total)
+    return (
+        records_30m,
+        total,
+        build_telegram_consensus(records_4h, total),
+        build_telegram_consensus(records_24h, total),
+    )
 
 
 def build_telegram_consensus(
@@ -221,77 +230,67 @@ def detect_new_trades(
     return alerts, {"initialized": True, "trades": stored, "updated_at": utc_str(utc_now_ms())}
 
 
-def _short_addr(address: str) -> str:
-    if len(address) <= 12:
-        return address
-    return f"{address[:6]}...{address[-4:]}"
-
-
 def format_consensus_top5(
     consensus: list[TelegramCoinConsensus],
     *,
+    window: str,
     top_n: int = TOP_N,
 ) -> str:
-    lines = [f"📊 共識 TOP{top_n} · 30M"]
+    lines = [f"📊 共識 TOP{top_n} · {window}"]
     if not consensus:
         lines.append("無共識標的")
         return "\n".join(lines)
 
     for i, item in enumerate(consensus[:top_n], start=1):
         direction = format_direction_zh(item.consensus_direction)
-        lines.append(
-            f"{i}. <b>{item.coin}</b> · {direction} · 淨比例 <b>{item.net_ratio:.0%}</b>"
-        )
-        lines.append(
-            f"   開多{item.open_long} · 開空{item.open_short} · "
-            f"平多{item.close_long} · 平空{item.close_short} · {item.account_count}帳號"
-        )
+        lines.append(f"{i}. <b>{item.coin}</b> · {direction}")
     return "\n".join(lines)
 
 
-def format_no_new_trades_message(
-    *,
-    account_total: int,
-    tracked: int,
-    consensus: list[TelegramCoinConsensus],
-) -> str:
-    return "\n".join([
-        f"✅ 掃描完成 · 無新成交（{ALERT_WINDOW_MIN}M）",
-        f"時間: {utc_str(utc_now_ms())}",
-        f"監控帳號: {account_total}",
-        f"追蹤成交: {tracked}",
-        "",
-        format_consensus_top5(consensus),
-    ])
-
-
-def format_new_trades_message(
-    records: list[OpenRecord],
-    *,
-    account_total: int,
-    consensus: list[TelegramCoinConsensus],
-) -> str:
-    lines = [
-        f"🆕 新成交 · {len(records)} 筆（{ALERT_WINDOW_MIN}M）",
-        f"時間: {utc_str(utc_now_ms())}",
-        f"監控帳號: {account_total}",
-        "",
-    ]
+def format_new_trades_message(records: list[OpenRecord]) -> str:
+    lines = [f"🆕 新成交 · {len(records)} 筆（{ALERT_WINDOW_MIN}M）", ""]
     for i, r in enumerate(records[:MAX_ALERTS], start=1):
-        name = r.display_name or "—"
-        lines.append(
-            f"{i}. <b>{r.coin}</b> · {format_direction_zh(r.direction)} · "
-            f"#{r.rank} · {_short_addr(r.address)}"
-        )
-        lines.append(
-            f"   均價 {r.avg_entry_px:,.4f} · {r.window} · {r.open_time} · {r.fill_count}筆"
-        )
-        if name != "—":
-            lines.append(f"   {name}")
+        lines.append(f"{i}. <b>{r.coin}</b> · {format_direction_zh(r.direction)}")
     if len(records) > MAX_ALERTS:
-        lines.append(f"\n…另有 {len(records) - MAX_ALERTS} 筆")
-    lines.extend(["", format_consensus_top5(consensus)])
+        lines.append(f"…另有 {len(records) - MAX_ALERTS} 筆")
     return "\n".join(lines)
+
+
+def consensus_bucket(ts_ms: int, bucket_ms: int) -> int:
+    return ts_ms // bucket_ms
+
+
+def maybe_send_scheduled_consensus(
+    token: str,
+    chat_id: str,
+    state: dict[str, Any],
+    *,
+    consensus_4h: list[TelegramCoinConsensus],
+    consensus_24h: list[TelegramCoinConsensus],
+    force_bootstrap: bool = False,
+) -> dict[str, Any]:
+    now = utc_now_ms()
+    bucket_4h = consensus_bucket(now, BUCKET_4H_MS)
+    bucket_24h = consensus_bucket(now, BUCKET_24H_MS)
+
+    if force_bootstrap or not state.get("initialized"):
+        state["last_consensus_4h_bucket"] = bucket_4h
+        state["last_consensus_24h_bucket"] = bucket_24h
+        return state
+
+    last_4h = int(state.get("last_consensus_4h_bucket", bucket_4h))
+    if bucket_4h > last_4h:
+        send_telegram_message(format_consensus_top5(consensus_4h, window="4H"), token, chat_id)
+        state["last_consensus_4h_bucket"] = bucket_4h
+        print("  Sent 4H consensus TOP5")
+
+    last_24h = int(state.get("last_consensus_24h_bucket", bucket_24h))
+    if bucket_24h > last_24h:
+        send_telegram_message(format_consensus_top5(consensus_24h, window="24H"), token, chat_id)
+        state["last_consensus_24h_bucket"] = bucket_24h
+        print("  Sent 24H consensus TOP5")
+
+    return state
 
 
 def send_telegram_message(text: str, token: str, chat_id: str) -> None:
@@ -328,13 +327,21 @@ def watch_new_trades(
 ) -> int:
     print("Running trade scan...")
     t0 = time.time()
-    records_30m, total, consensus = run_trade_scan(output_dir, **scan_kwargs)
+    records_30m, total, consensus_4h, consensus_24h = run_trade_scan(output_dir, **scan_kwargs)
     current = merge_records(records_30m)
     state = load_trade_state(output_dir)
     if force_bootstrap:
         state = {"initialized": False, "trades": {}}
 
     alerts, new_state = detect_new_trades(current, state)
+    new_state = maybe_send_scheduled_consensus(
+        token,
+        chat_id,
+        new_state,
+        consensus_4h=consensus_4h,
+        consensus_24h=consensus_24h,
+        force_bootstrap=force_bootstrap or not state.get("initialized"),
+    )
     save_trade_state(output_dir, new_state)
 
     print(
@@ -348,21 +355,9 @@ def watch_new_trades(
 
     if not alerts:
         print("  No new trades")
-        msg = format_no_new_trades_message(
-            account_total=total,
-            tracked=len(current),
-            consensus=consensus,
-        )
-        send_telegram_message(msg, token, chat_id)
-        print("  Sent no-new-trades summary")
         return 0
 
-    msg = format_new_trades_message(
-        alerts,
-        account_total=total,
-        consensus=consensus,
-    )
-    send_telegram_message(msg, token, chat_id)
+    send_telegram_message(format_new_trades_message(alerts), token, chat_id)
     print(f"  Sent {len(alerts)} new trade alert(s)")
     return len(alerts)
 
