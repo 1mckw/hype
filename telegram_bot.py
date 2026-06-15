@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from fetch_top_traders import (
@@ -45,12 +46,11 @@ TOP_N = 5
 BUCKET_4H_MS = 4 * 3_600_000
 BUCKET_24H_MS = 24 * 3_600_000
 
-# Telegram HTML has no custom RGB colors; <code> renders as accent-colored text.
-DIRECTION_HTML = {
-    "開多": "<code>開多</code>",
-    "開空": "<s>開空</s>",
-    "平多": "<u>平多</u>",
-    "平空": "<i>平空</i>",
+DIRECTION_EMOJI = {
+    "開多": "🟢 開多",
+    "開空": "🔴 開空",
+    "平多": "🟠平多",
+    "平空": "🔵平空",
 }
 
 
@@ -70,12 +70,11 @@ class TelegramCoinConsensus:
 
 def format_direction_colored(direction: str) -> str:
     zh = format_direction_zh(direction)
-    styled = DIRECTION_HTML.get(zh)
-    if styled:
-        return styled
-    if zh == "混合":
-        return "<i>混合</i>"
-    return zh
+    return DIRECTION_EMOJI.get(zh, zh)
+
+
+def format_open_time_hm(open_ts: int) -> str:
+    return datetime.fromtimestamp(open_ts / 1000, tz=timezone.utc).strftime("%H:%M")
 
 
 def run_trade_scan(
@@ -281,7 +280,10 @@ def format_no_new_trades_message(*, tracked: int) -> str:
 def format_new_trades_message(records: list[OpenRecord]) -> str:
     lines = [f"🆕 新成交 · {len(records)} 筆（{ALERT_WINDOW_LABEL}）", ""]
     for i, r in enumerate(records[:MAX_ALERTS], start=1):
-        lines.append(f"{i}. <b>{html.escape(r.coin)}</b> · {format_direction_colored(r.direction)}")
+        lines.append(
+            f"{i}. <b>{html.escape(r.coin)}</b> · {format_direction_colored(r.direction)}"
+            f"    {format_open_time_hm(r.open_ts)}"
+        )
     if len(records) > MAX_ALERTS:
         lines.append(f"…另有 {len(records) - MAX_ALERTS} 筆")
     return "\n".join(lines)
