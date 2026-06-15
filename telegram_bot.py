@@ -295,6 +295,8 @@ def watch_consensus(
     output_dir: str,
     scan_kwargs: dict,
     *,
+    force: bool = False,
+    force_24h: bool = False,
     force_bootstrap: bool = False,
 ) -> int:
     print("Checking consensus schedule...")
@@ -315,23 +317,30 @@ def watch_consensus(
         print("  State bootstrapped, no alerts sent")
         return 0
 
-    need_consensus_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
-    need_consensus_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
+    if force:
+        need_consensus_4h = True
+        need_consensus_24h = force_24h
+        if not state.get("initialized"):
+            state["initialized"] = True
+        print("  Force mode: sending consensus now")
+    else:
+        need_consensus_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
+        need_consensus_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
 
-    if not state.get("initialized"):
-        state = {
-            "initialized": True,
-            "last_consensus_4h_bucket": bucket_4h,
-            "last_consensus_24h_bucket": bucket_24h,
-            "bootstrapped_at": utc_str(now),
-        }
-        save_state(output_dir, state)
-        print("  First run: state bootstrapped, no alerts sent")
-        return 0
+        if not state.get("initialized"):
+            state = {
+                "initialized": True,
+                "last_consensus_4h_bucket": bucket_4h,
+                "last_consensus_24h_bucket": bucket_24h,
+                "bootstrapped_at": utc_str(now),
+            }
+            save_state(output_dir, state)
+            print("  First run: state bootstrapped, no alerts sent")
+            return 0
 
-    if not need_consensus_4h and not need_consensus_24h:
-        print("  No consensus due")
-        return 0
+        if not need_consensus_4h and not need_consensus_24h:
+            print("  No consensus due")
+            return 0
 
     print("Running consensus scan...")
     total, consensus_4h, consensus_24h = run_consensus_scan(
@@ -388,6 +397,8 @@ def main() -> int:
     parser.add_argument("--loop", action="store_true", help="Poll forever (default interval 4 hours)")
     parser.add_argument("--interval-min", type=int, default=POLL_INTERVAL_SEC // 60)
     parser.add_argument("--bootstrap", action="store_true", help="Reset state without sending alerts")
+    parser.add_argument("--force", action="store_true", help="Send 4H consensus now, ignoring schedule")
+    parser.add_argument("--force-24h", action="store_true", help="With --force, also send 24H consensus")
     parser.add_argument("--count", type=int, default=300)
     parser.add_argument("--min-year-roi", type=float, default=MIN_YEAR_ROI)
     parser.add_argument("--min-closed", type=int, default=5)
@@ -438,7 +449,14 @@ def main() -> int:
             return 0
 
         if args.once or args.gha:
-            watch_consensus(args.token, args.chat_id, args.output_dir, scan_kwargs)
+            watch_consensus(
+                args.token,
+                args.chat_id,
+                args.output_dir,
+                scan_kwargs,
+                force=args.force,
+                force_24h=args.force_24h,
+            )
             return 0
 
         print(f"Consensus bot started · poll every {interval_sec // 60} min")

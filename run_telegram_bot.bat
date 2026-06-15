@@ -32,7 +32,7 @@ if "%TELEGRAM_CHAT_ID%"=="" (
 if not exist "output" mkdir "output"
 
 echo Schedule: 4H / 24H consensus TOP5 (GitHub Actions every 4 hours)
-echo Test once: python telegram_bot.py --once
+echo Test once: python telegram_bot.py --once --force
 echo Reset baseline: python telegram_bot.py --bootstrap
 echo.
 
