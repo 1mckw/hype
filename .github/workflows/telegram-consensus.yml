@@ -2,8 +2,8 @@ name: Telegram Trade Alerts
 
 on:
   schedule:
-    # Poll every 30 minutes for new trades
-    - cron: "*/30 * * * *"
+    # Poll every hour for new trades
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -29,9 +29,9 @@ jobs:
             output/leaderboard_cache.json
             output/fills_cache.json
             output/telegram_state.json
-          key: hl-cache-${{ github.run_id }}
+          key: hl-cache-v1
           restore-keys: |
-            hl-cache-
+            hl-cache-v1
 
       - name: Scan and alert new trades
         env:

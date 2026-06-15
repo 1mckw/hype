@@ -31,12 +31,12 @@ if "%TELEGRAM_CHAT_ID%"=="" (
 
 if not exist "output" mkdir "output"
 
-echo Schedule: poll every 30 min for new trades (GitHub Actions)
+echo Schedule: poll every 1 hour for new trades (GitHub Actions)
 echo Test once: python telegram_bot.py --once
 echo Reset baseline: python telegram_bot.py --bootstrap
 echo.
 
-python "%~dp0telegram_bot.py" --loop --interval-min 30 --output-dir "%~dp0output"
+python "%~dp0telegram_bot.py" --loop --interval-min 60 --output-dir "%~dp0output"
 set EXITCODE=%ERRORLEVEL%
 
 echo.

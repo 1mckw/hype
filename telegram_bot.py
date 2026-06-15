@@ -10,9 +10,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any
-
 from dataclasses import dataclass
+from typing import Any
 
 from fetch_top_traders import (
     FILLS_CACHE_FILE,
@@ -37,12 +36,21 @@ from fetch_top_traders import (
 )
 
 STATE_FILE = "telegram_state.json"
-POLL_INTERVAL_SEC = 30 * 60
-ALERT_WINDOW_MIN = 30
+POLL_INTERVAL_SEC = 60 * 60
+ALERT_WINDOW_MIN = 60
+ALERT_WINDOW_LABEL = "1H"
 MAX_ALERTS = 25
 TOP_N = 5
 BUCKET_4H_MS = 4 * 3_600_000
 BUCKET_24H_MS = 24 * 3_600_000
+
+# Telegram HTML has no custom RGB colors; <code> renders as accent-colored text.
+DIRECTION_HTML = {
+    "開多": "<code>開多</code>",
+    "開空": "<s>開空</s>",
+    "平多": "<u>平多</u>",
+    "平空": "<i>平空</i>",
+}
 
 
 @dataclass
@@ -59,6 +67,16 @@ class TelegramCoinConsensus:
     close_short: int
 
 
+def format_direction_colored(direction: str) -> str:
+    zh = format_direction_zh(direction)
+    styled = DIRECTION_HTML.get(zh)
+    if styled:
+        return styled
+    if zh == "混合":
+        return "<i>混合</i>"
+    return zh
+
+
 def run_trade_scan(
     output_dir: str,
     *,
@@ -68,6 +86,8 @@ def run_trade_scan(
     workers: int = 24,
     fast: bool = True,
     use_cache: bool = True,
+    need_consensus_4h: bool = False,
+    need_consensus_24h: bool = False,
 ) -> tuple[list[OpenRecord], int, list[TelegramCoinConsensus], list[TelegramCoinConsensus]]:
     os.makedirs(output_dir, exist_ok=True)
     rows = fetch_leaderboard(output_dir, use_cache=use_cache)
@@ -81,17 +101,20 @@ def run_trade_scan(
     )
     if not qualified:
         raise RuntimeError("No qualified traders found")
-    records_30m = records_from_qualified_minutes(
-        qualified, ALERT_WINDOW_MIN, window="30M",
+
+    records_1h = records_from_qualified_minutes(
+        qualified, ALERT_WINDOW_MIN, window=ALERT_WINDOW_LABEL,
     )
-    records_4h, records_24h = records_from_qualified(qualified)
     total = len(qualified)
-    return (
-        records_30m,
-        total,
-        build_telegram_consensus(records_4h, total),
-        build_telegram_consensus(records_24h, total),
-    )
+    consensus_4h: list[TelegramCoinConsensus] = []
+    consensus_24h: list[TelegramCoinConsensus] = []
+    if need_consensus_4h or need_consensus_24h:
+        records_4h, records_24h = records_from_qualified(qualified)
+        if need_consensus_4h:
+            consensus_4h = build_telegram_consensus(records_4h, total)
+        if need_consensus_24h:
+            consensus_24h = build_telegram_consensus(records_24h, total)
+    return records_1h, total, consensus_4h, consensus_24h
 
 
 def build_telegram_consensus(
@@ -242,15 +265,15 @@ def format_consensus_top5(
         return "\n".join(lines)
 
     for i, item in enumerate(consensus[:top_n], start=1):
-        direction = format_direction_zh(item.consensus_direction)
+        direction = format_direction_colored(item.consensus_direction)
         lines.append(f"{i}. <b>{item.coin}</b> · {direction}")
     return "\n".join(lines)
 
 
 def format_new_trades_message(records: list[OpenRecord]) -> str:
-    lines = [f"🆕 新成交 · {len(records)} 筆（{ALERT_WINDOW_MIN}M）", ""]
+    lines = [f"🆕 新成交 · {len(records)} 筆（{ALERT_WINDOW_LABEL}）", ""]
     for i, r in enumerate(records[:MAX_ALERTS], start=1):
-        lines.append(f"{i}. <b>{r.coin}</b> · {format_direction_zh(r.direction)}")
+        lines.append(f"{i}. <b>{r.coin}</b> · {format_direction_colored(r.direction)}")
     if len(records) > MAX_ALERTS:
         lines.append(f"…另有 {len(records) - MAX_ALERTS} 筆")
     return "\n".join(lines)
@@ -260,6 +283,14 @@ def consensus_bucket(ts_ms: int, bucket_ms: int) -> int:
     return ts_ms // bucket_ms
 
 
+def consensus_due(state: dict[str, Any], bucket_ms: int, key: str) -> bool:
+    if not state.get("initialized"):
+        return False
+    now_bucket = consensus_bucket(utc_now_ms(), bucket_ms)
+    last_bucket = int(state.get(key, now_bucket))
+    return now_bucket > last_bucket
+
+
 def maybe_send_scheduled_consensus(
     token: str,
     chat_id: str,
@@ -267,6 +298,8 @@ def maybe_send_scheduled_consensus(
     *,
     consensus_4h: list[TelegramCoinConsensus],
     consensus_24h: list[TelegramCoinConsensus],
+    need_consensus_4h: bool,
+    need_consensus_24h: bool,
     force_bootstrap: bool = False,
 ) -> dict[str, Any]:
     now = utc_now_ms()
@@ -278,14 +311,12 @@ def maybe_send_scheduled_consensus(
         state["last_consensus_24h_bucket"] = bucket_24h
         return state
 
-    last_4h = int(state.get("last_consensus_4h_bucket", bucket_4h))
-    if bucket_4h > last_4h:
+    if need_consensus_4h:
         send_telegram_message(format_consensus_top5(consensus_4h, window="4H"), token, chat_id)
         state["last_consensus_4h_bucket"] = bucket_4h
         print("  Sent 4H consensus TOP5")
 
-    last_24h = int(state.get("last_consensus_24h_bucket", bucket_24h))
-    if bucket_24h > last_24h:
+    if need_consensus_24h:
         send_telegram_message(format_consensus_top5(consensus_24h, window="24H"), token, chat_id)
         state["last_consensus_24h_bucket"] = bucket_24h
         print("  Sent 24H consensus TOP5")
@@ -327,39 +358,70 @@ def watch_new_trades(
 ) -> int:
     print("Running trade scan...")
     t0 = time.time()
-    records_30m, total, consensus_4h, consensus_24h = run_trade_scan(output_dir, **scan_kwargs)
-    current = merge_records(records_30m)
     state = load_trade_state(output_dir)
     if force_bootstrap:
         state = {"initialized": False, "trades": {}}
 
+    need_consensus_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
+    need_consensus_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
+
+    records_1h, total, consensus_4h, consensus_24h = run_trade_scan(
+        output_dir,
+        need_consensus_4h=need_consensus_4h,
+        need_consensus_24h=need_consensus_24h,
+        **scan_kwargs,
+    )
+    current = merge_records(records_1h)
+    prev_initialized = bool(state.get("initialized"))
+
     alerts, new_state = detect_new_trades(current, state)
+    for key in ("last_consensus_4h_bucket", "last_consensus_24h_bucket"):
+        if key in state:
+            new_state[key] = state[key]
+
+    if not prev_initialized and not force_bootstrap:
+        new_state = maybe_send_scheduled_consensus(
+            token,
+            chat_id,
+            new_state,
+            consensus_4h=consensus_4h,
+            consensus_24h=consensus_24h,
+            need_consensus_4h=False,
+            need_consensus_24h=False,
+            force_bootstrap=True,
+        )
+        save_trade_state(output_dir, new_state)
+        print(
+            f"  Scan done in {time.time() - t0:.0f}s · accounts={total} · "
+            f"tracked={len(current)} · new=0"
+        )
+        print("  First run: state bootstrapped, no alerts sent")
+        return 0
+
+    sent = 0
+    if alerts:
+        send_telegram_message(format_new_trades_message(alerts), token, chat_id)
+        sent = len(alerts)
+        print(f"  Sent {sent} new trade alert(s)")
+
     new_state = maybe_send_scheduled_consensus(
         token,
         chat_id,
         new_state,
         consensus_4h=consensus_4h,
         consensus_24h=consensus_24h,
-        force_bootstrap=force_bootstrap or not state.get("initialized"),
+        need_consensus_4h=need_consensus_4h,
+        need_consensus_24h=need_consensus_24h,
     )
     save_trade_state(output_dir, new_state)
 
     print(
         f"  Scan done in {time.time() - t0:.0f}s · accounts={total} · "
-        f"tracked={len(current)} · new={len(alerts)}"
+        f"tracked={len(current)} · new={sent}"
     )
-
-    if not state.get("initialized") and not force_bootstrap:
-        print("  First run: state bootstrapped, no alerts sent")
-        return 0
-
     if not alerts:
         print("  No new trades")
-        return 0
-
-    send_telegram_message(format_new_trades_message(alerts), token, chat_id)
-    print(f"  Sent {len(alerts)} new trade alert(s)")
-    return len(alerts)
+    return sent
 
 
 def run_loop(
@@ -386,7 +448,7 @@ def main() -> int:
     parser.add_argument("--output-dir", default=os.environ.get("TELEGRAM_OUTPUT_DIR", "output"))
     parser.add_argument("--once", action="store_true", help="Scan once and exit")
     parser.add_argument("--gha", action="store_true", help="GitHub Actions mode (same as --once)")
-    parser.add_argument("--loop", action="store_true", help="Poll forever (default interval 30 min)")
+    parser.add_argument("--loop", action="store_true", help="Poll forever (default interval 1 hour)")
     parser.add_argument("--interval-min", type=int, default=POLL_INTERVAL_SEC // 60)
     parser.add_argument("--bootstrap", action="store_true", help="Reset state without sending alerts")
     parser.add_argument("--count", type=int, default=300)
