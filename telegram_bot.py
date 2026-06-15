@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -218,6 +219,8 @@ def load_trade_state(output_dir: str) -> dict[str, Any]:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict) and isinstance(data.get("trades"), dict):
+            if data["trades"] and not data.get("initialized"):
+                data["initialized"] = True
             return data
     except (json.JSONDecodeError, OSError):
         pass
@@ -237,8 +240,9 @@ def detect_new_trades(
 ) -> tuple[list[OpenRecord], dict[str, Any]]:
     stored: dict[str, dict[str, Any]] = dict(state.get("trades") or {})
     alerts: list[OpenRecord] = []
+    initialized = bool(state.get("initialized")) or bool(stored)
 
-    if not state.get("initialized"):
+    if not initialized:
         for key, record in current.items():
             stored[key] = {"fill_count": record.fill_count}
         return [], {"initialized": True, "trades": stored, "bootstrapped_at": utc_str(utc_now_ms())}
@@ -266,14 +270,18 @@ def format_consensus_top5(
 
     for i, item in enumerate(consensus[:top_n], start=1):
         direction = format_direction_colored(item.consensus_direction)
-        lines.append(f"{i}. <b>{item.coin}</b> · {direction}")
+        lines.append(f"{i}. <b>{html.escape(item.coin)}</b> · {direction}")
     return "\n".join(lines)
+
+
+def format_no_new_trades_message(*, tracked: int) -> str:
+    return f"✅ 掃描完成 · 無新成交（{ALERT_WINDOW_LABEL}）\n追蹤成交: {tracked}"
 
 
 def format_new_trades_message(records: list[OpenRecord]) -> str:
     lines = [f"🆕 新成交 · {len(records)} 筆（{ALERT_WINDOW_LABEL}）", ""]
     for i, r in enumerate(records[:MAX_ALERTS], start=1):
-        lines.append(f"{i}. <b>{r.coin}</b> · {format_direction_colored(r.direction)}")
+        lines.append(f"{i}. <b>{html.escape(r.coin)}</b> · {format_direction_colored(r.direction)}")
     if len(records) > MAX_ALERTS:
         lines.append(f"…另有 {len(records) - MAX_ALERTS} 筆")
     return "\n".join(lines)
@@ -284,10 +292,12 @@ def consensus_bucket(ts_ms: int, bucket_ms: int) -> int:
 
 
 def consensus_due(state: dict[str, Any], bucket_ms: int, key: str) -> bool:
-    if not state.get("initialized"):
+    if not state.get("initialized") and not state.get("trades"):
         return False
     now_bucket = consensus_bucket(utc_now_ms(), bucket_ms)
-    last_bucket = int(state.get(key, now_bucket))
+    if key not in state:
+        return True
+    last_bucket = int(state[key])
     return now_bucket > last_bucket
 
 
@@ -372,7 +382,7 @@ def watch_new_trades(
         **scan_kwargs,
     )
     current = merge_records(records_1h)
-    prev_initialized = bool(state.get("initialized"))
+    prev_initialized = bool(state.get("initialized")) or bool(state.get("trades"))
 
     alerts, new_state = detect_new_trades(current, state)
     for key in ("last_consensus_4h_bucket", "last_consensus_24h_bucket"):
@@ -403,6 +413,9 @@ def watch_new_trades(
         send_telegram_message(format_new_trades_message(alerts), token, chat_id)
         sent = len(alerts)
         print(f"  Sent {sent} new trade alert(s)")
+    else:
+        send_telegram_message(format_no_new_trades_message(tracked=len(current)), token, chat_id)
+        print("  Sent no-new-trades summary")
 
     new_state = maybe_send_scheduled_consensus(
         token,
@@ -419,8 +432,6 @@ def watch_new_trades(
         f"  Scan done in {time.time() - t0:.0f}s · accounts={total} · "
         f"tracked={len(current)} · new={sent}"
     )
-    if not alerts:
-        print("  No new trades")
     return sent
 
 
