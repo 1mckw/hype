@@ -1,13 +1,13 @@
-name: Telegram Trade Alerts
+name: Telegram Consensus Alerts
 
 on:
   schedule:
-    # Poll every hour for new trades
-    - cron: "0 * * * *"
+    # Check every 4 hours for 4H / 24H consensus
+    - cron: "0 */4 * * *"
   workflow_dispatch:
 
 concurrency:
-  group: telegram-trade-alerts
+  group: telegram-consensus-alerts
   cancel-in-progress: false
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
           restore-keys: |
             hl-cache-v1
 
-      - name: Scan and alert new trades
+      - name: Scan and push consensus
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
