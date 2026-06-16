@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Telegram bot: scheduled HTML report (4H / 24H)."""
+"""Telegram bot: scheduled 4H / 24H consensus TOP5 + HTML report."""
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -11,11 +12,13 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from fetch_top_traders import (
     FILLS_CACHE_FILE,
     FILLS_CACHE_TTL_SEC,
+    MIN_CONSENSUS_ACCOUNTS,
     MIN_YEAR_ROI,
     OpenRecord,
     TraderFills,
@@ -25,7 +28,10 @@ from fetch_top_traders import (
     configure_info_urls,
     configure_min_year_roi,
     configure_wr_days,
+    direction_side,
     fetch_leaderboard,
+    format_direction_zh,
+    net_ratio,
     records_from_qualified,
     select_top_traders,
     utc_now_ms,
@@ -36,8 +42,134 @@ from fetch_top_traders import (
 STATE_FILE = "telegram_state.json"
 HTML_REPORT_FILE = "report.html"
 POLL_INTERVAL_SEC = 4 * 60 * 60
+TOP_N = 5
 BUCKET_4H_MS = 4 * 3_600_000
 BUCKET_24H_MS = 24 * 3_600_000
+
+DIRECTION_EMOJI = {
+    "開多": "🟢 開多",
+    "開空": "🔴 開空",
+    "平多": "🟠平多",
+    "平空": "🔵平空",
+}
+DIRECTION_ORDER = {"開多": 0, "平多": 1, "開空": 2, "平空": 3}
+
+
+@dataclass
+class TelegramCoinConsensus:
+    coin: str
+    account_count: int
+    long_accounts: int
+    short_accounts: int
+    net_ratio: float
+    consensus_direction: str
+    open_long: int
+    open_short: int
+    close_long: int
+    close_short: int
+
+
+def format_direction_colored(direction: str) -> str:
+    zh = format_direction_zh(direction)
+    return DIRECTION_EMOJI.get(zh, zh)
+
+
+def consensus_primary_direction(item: TelegramCoinConsensus) -> str:
+    ranked = (
+        ("開多", item.open_long),
+        ("平多", item.close_long),
+        ("開空", item.open_short),
+        ("平空", item.close_short),
+    )
+    return max(ranked, key=lambda pair: pair[1])[0]
+
+
+def sort_consensus_by_direction(
+    consensus: list[TelegramCoinConsensus],
+) -> list[TelegramCoinConsensus]:
+    return sorted(
+        consensus,
+        key=lambda item: (
+            DIRECTION_ORDER.get(consensus_primary_direction(item), 99),
+            -item.account_count,
+            item.coin,
+        ),
+    )
+
+
+def build_telegram_consensus(
+    records: list[OpenRecord],
+    total_accounts: int,
+) -> list[TelegramCoinConsensus]:
+    by_coin: dict[str, dict[str, set[str]]] = {}
+
+    for record in records:
+        coin = record.coin
+        bucket = by_coin.get(coin)
+        if bucket is None:
+            bucket = {
+                "open_long": set(),
+                "open_short": set(),
+                "close_long": set(),
+                "close_short": set(),
+                "long": set(),
+                "short": set(),
+            }
+            by_coin[coin] = bucket
+
+        dir_zh = format_direction_zh(record.direction)
+        if dir_zh == "開多":
+            bucket["open_long"].add(record.address)
+        elif dir_zh == "開空":
+            bucket["open_short"].add(record.address)
+        elif dir_zh == "平多":
+            bucket["close_long"].add(record.address)
+        elif dir_zh == "平空":
+            bucket["close_short"].add(record.address)
+
+        side = direction_side(record.direction)
+        if side == "Long":
+            bucket["long"].add(record.address)
+        elif side == "Short":
+            bucket["short"].add(record.address)
+
+    results: list[TelegramCoinConsensus] = []
+    for coin, bucket in by_coin.items():
+        long_n = len(bucket["long"])
+        short_n = len(bucket["short"])
+        account_count = len(bucket["long"] | bucket["short"])
+        if account_count < MIN_CONSENSUS_ACCOUNTS:
+            continue
+
+        if long_n > short_n:
+            direction = "Long"
+        elif short_n > long_n:
+            direction = "Short"
+        elif long_n > 0:
+            direction = "Mixed"
+        else:
+            direction = "—"
+
+        results.append(
+            TelegramCoinConsensus(
+                coin=coin,
+                account_count=account_count,
+                long_accounts=long_n,
+                short_accounts=short_n,
+                net_ratio=net_ratio(long_n, short_n, account_count),
+                consensus_direction=direction,
+                open_long=len(bucket["open_long"]),
+                open_short=len(bucket["open_short"]),
+                close_long=len(bucket["close_long"]),
+                close_short=len(bucket["close_short"]),
+            )
+        )
+
+    results.sort(
+        key=lambda item: (item.account_count, item.open_long + item.close_long + item.open_short + item.close_short),
+        reverse=True,
+    )
+    return results
 
 
 def run_full_scan(
@@ -104,6 +236,54 @@ def consensus_due(state: dict[str, Any], bucket_ms: int, key: str) -> bool:
     if key not in state:
         return True
     return now_bucket > int(state[key])
+
+
+def format_consensus_top5(
+    consensus: list[TelegramCoinConsensus],
+    *,
+    window: str,
+    top_n: int = TOP_N,
+) -> str:
+    lines = [f"📊 共識 TOP{top_n} · {window}"]
+    ranked = sort_consensus_by_direction(consensus)
+    if not ranked:
+        lines.append("無共識標的")
+        return "\n".join(lines)
+
+    for i, item in enumerate(ranked[:top_n], start=1):
+        direction = format_direction_colored(item.consensus_direction)
+        lines.append(
+            f"{i}. <b>{html.escape(item.coin)}</b> · {direction} · 淨比例 <b>{item.net_ratio:.0%}</b>"
+        )
+        lines.append(
+            f"   開多{item.open_long} · 開空{item.open_short} · "
+            f"平多{item.close_long} · 平空{item.close_short} · {item.account_count}帳號"
+        )
+    return "\n".join(lines)
+
+
+def send_telegram_message(text: str, token: str, chat_id: str) -> None:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = json.dumps({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"Telegram HTTP {exc.code}: {detail}") from exc
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram API error: {body}")
 
 
 def send_telegram_document(
@@ -183,18 +363,14 @@ def watch_consensus(
         return 0
 
     if force:
-        need_push = True
-        update_4h = True
-        update_24h = force_24h
+        send_4h = True
+        send_24h = force_24h
         if not state.get("initialized"):
             state["initialized"] = True
-        print("  Force mode: sending HTML report now")
+        print("  Force mode: sending consensus + HTML report now")
     else:
-        due_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
-        due_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
-        need_push = due_4h or due_24h
-        update_4h = due_4h
-        update_24h = due_24h
+        send_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
+        send_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
 
         if not state.get("initialized"):
             state = {
@@ -207,14 +383,16 @@ def watch_consensus(
             print("  First run: state bootstrapped, no alerts sent")
             return 0
 
-        if not need_push:
-            print("  No report due")
+        if not send_4h and not send_24h:
+            print("  No consensus due")
             return 0
 
-    print("Running full scan and building HTML report...")
+    print("Running full scan...")
     total, qualified, records_4h, records_24h = run_full_scan(output_dir, **scan_kwargs)
     consensus_4h = build_consensus(records_4h, "4H", total)
     consensus_24h = build_consensus(records_24h, "24H", total)
+    telegram_4h = build_telegram_consensus(records_4h, total)
+    telegram_24h = build_telegram_consensus(records_24h, total)
 
     html_path = os.path.join(output_dir, HTML_REPORT_FILE)
     write_html_report(
@@ -229,18 +407,29 @@ def watch_consensus(
     size_kb = os.path.getsize(html_path) / 1024
     print(f"  HTML report: {html_path} ({size_kb:.0f} KB)")
 
+    sent = 0
+    if send_4h:
+        send_telegram_message(format_consensus_top5(telegram_4h, window="4H"), token, chat_id)
+        state["last_consensus_4h_bucket"] = bucket_4h
+        sent += 1
+        print("  Sent 4H consensus TOP5")
+
+    if send_24h:
+        send_telegram_message(format_consensus_top5(telegram_24h, window="24H"), token, chat_id)
+        state["last_consensus_24h_bucket"] = bucket_24h
+        sent += 1
+        print("  Sent 24H consensus TOP5")
+
     caption = f"📊 Perp 高 ROI 帳號報告\n{utc_str(now)} · {total} 帳號"
     send_telegram_document(html_path, token, chat_id, caption=caption)
+    sent += 1
+    print("  Sent report.html")
 
-    if update_4h:
-        state["last_consensus_4h_bucket"] = bucket_4h
-    if update_24h:
-        state["last_consensus_24h_bucket"] = bucket_24h
     state["updated_at"] = utc_str(now)
     save_state(output_dir, state)
 
-    print(f"  Done in {time.time() - t0:.0f}s · accounts={total} · sent report.html")
-    return 1
+    print(f"  Done in {time.time() - t0:.0f}s · accounts={total} · messages={sent}")
+    return sent
 
 
 def run_loop(
@@ -264,7 +453,7 @@ def run_loop(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Telegram scheduled HTML report.")
+    parser = argparse.ArgumentParser(description="Telegram 4H / 24H consensus TOP5 + HTML report.")
     parser.add_argument("--token", default=os.environ.get("TELEGRAM_BOT_TOKEN", ""))
     parser.add_argument("--chat-id", default=os.environ.get("TELEGRAM_CHAT_ID", ""))
     parser.add_argument("--output-dir", default=os.environ.get("TELEGRAM_OUTPUT_DIR", "output"))
@@ -273,8 +462,8 @@ def main() -> int:
     parser.add_argument("--loop", action="store_true", help="Poll forever (default interval 4 hours)")
     parser.add_argument("--interval-min", type=int, default=POLL_INTERVAL_SEC // 60)
     parser.add_argument("--bootstrap", action="store_true", help="Reset state without sending alerts")
-    parser.add_argument("--force", action="store_true", help="Send HTML report now, ignoring schedule")
-    parser.add_argument("--force-24h", action="store_true", help="With --force, also update 24H schedule bucket")
+    parser.add_argument("--force", action="store_true", help="Send 4H consensus + HTML now, ignoring schedule")
+    parser.add_argument("--force-24h", action="store_true", help="With --force, also send 24H consensus")
     parser.add_argument("--count", type=int, default=300)
     parser.add_argument("--min-year-roi", type=float, default=MIN_YEAR_ROI)
     parser.add_argument("--min-closed", type=int, default=5)
@@ -336,7 +525,7 @@ def main() -> int:
             )
             return 0
 
-        print(f"HTML report bot started · poll every {interval_sec // 60} min")
+        print(f"Consensus + HTML bot started · poll every {interval_sec // 60} min")
         run_loop(
             args.token, args.chat_id, args.output_dir, scan_kwargs,
             min_year_roi=args.min_year_roi, interval_sec=interval_sec,
