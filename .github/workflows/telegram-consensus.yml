@@ -1,17 +1,17 @@
-name: Telegram Consensus Alerts
+name: Telegram HTML Report
 
 on:
   schedule:
-    # Check every 4 hours for 4H / 24H consensus
+    # Check every 4 hours for 4H / 24H report
     - cron: "0 */4 * * *"
   workflow_dispatch:
     inputs:
       force:
-        description: Force send 4H consensus now
+        description: Force send HTML report now
         type: boolean
         default: true
       force_24h:
-        description: Also force send 24H consensus
+        description: Also update 24H schedule bucket
         type: boolean
         default: false
 
@@ -37,12 +37,13 @@ jobs:
           path: |
             output/leaderboard_cache.json
             output/fills_cache.json
+            output/profiles_cache.json
             output/telegram_state.json
           key: hl-cache-v1
           restore-keys: |
             hl-cache-v1
 
-      - name: Scan and push consensus
+      - name: Scan and push HTML report
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -62,5 +63,6 @@ jobs:
           path: |
             output/leaderboard_cache.json
             output/fills_cache.json
+            output/profiles_cache.json
             output/telegram_state.json
           key: hl-cache-v1

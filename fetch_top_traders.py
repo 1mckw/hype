@@ -1124,23 +1124,6 @@ def _order_side_badge(side: str) -> str:
     return f'<span class="badge {cls}">{label}</span>'
 
 
-def _position_entry_map(profile: dict[str, Any]) -> dict[str, float]:
-    entries: dict[str, float] = {}
-    for pos in profile.get("positions") or []:
-        if not isinstance(pos, dict):
-            continue
-        coin = str(pos.get("coin", ""))
-        if not coin:
-            continue
-        try:
-            entry = float(pos.get("entry_px", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if entry > 0:
-            entries[coin] = entry
-    return entries
-
-
 def _pnl_at_hist(hist: list[list[Any]], ts: int) -> float | None:
     val = _hist_value_at(hist, ts)
     return val
@@ -1209,7 +1192,6 @@ def fetch_address_profile(address: str) -> dict[str, Any]:
         "withdrawable": 0.0,
         "withdraw_pct": 0.0,
         "positions": [],
-        "orders": [],
         "fills": [],
         "ledger": [],
         "spot_balances": [],
@@ -1218,7 +1200,6 @@ def fetch_address_profile(address: str) -> dict[str, Any]:
     try:
         ch = post_info({"type": "clearinghouseState", "user": address})
         spot = post_info({"type": "spotClearinghouseState", "user": address})
-        orders_raw = post_info({"type": "frontendOpenOrders", "user": address})
         portfolio_raw = post_info({"type": "portfolio", "user": address})
         fills_raw = post_info({"type": "userFills", "user": address, "aggregateByTime": True})
         ledger_raw = post_info({
@@ -1298,26 +1279,6 @@ def fetch_address_profile(address: str) -> dict[str, Any]:
                 profile["pnl"]["d30"] = pnl_now - start30
             step = max(1, len(pnl_hist) // 120)
             profile["chart"] = [[int(pt[0]), float(pt[1])] for pt in pnl_hist[::step]]
-
-    if isinstance(orders_raw, list):
-        orders: list[dict[str, Any]] = []
-        for o in orders_raw:
-            if not isinstance(o, dict):
-                continue
-            side = "賣" if str(o.get("side", "")).upper() == "A" else "買"
-            try:
-                orders.append({
-                    "coin": str(o.get("coin", "")),
-                    "side": side,
-                    "px": float(o.get("limitPx", 0) or 0),
-                    "sz": float(o.get("sz", 0) or 0),
-                    "oid": int(o.get("oid", 0) or 0),
-                    "type": str(o.get("orderType", "Limit")),
-                    "reduce_only": bool(o.get("reduceOnly")),
-                })
-            except (TypeError, ValueError):
-                continue
-        profile["orders"] = orders
 
     if isinstance(fills_raw, list):
         fills: list[dict[str, Any]] = []
@@ -1438,180 +1399,6 @@ def _fmt_px_range(lo: float, hi: float) -> str:
     return f"{lo:,.4f} – {hi:,.4f}"
 
 
-def fetch_candles_chart(coin: str, interval: str = "4h", bars: int = 72) -> list[list[float]]:
-    end_ms = utc_now_ms()
-    interval_ms = 4 * HOUR_MS if interval == "4h" else HOUR_MS
-    start_ms = end_ms - bars * interval_ms
-    try:
-        raw = post_info({
-            "type": "candleSnapshot",
-            "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
-        })
-    except Exception:
-        return []
-    candles: list[list[float]] = []
-    if isinstance(raw, list):
-        for c in raw:
-            if not isinstance(c, dict):
-                continue
-            t = int(c.get("t", 0) or 0)
-            if t <= 0:
-                continue
-            try:
-                candles.append([
-                    float(t),
-                    float(c.get("o", 0) or 0),
-                    float(c.get("h", 0) or 0),
-                    float(c.get("l", 0) or 0),
-                    float(c.get("c", 0) or 0),
-                ])
-            except (TypeError, ValueError):
-                continue
-    candles.sort(key=lambda x: x[0])
-    time.sleep(0.03)
-    return candles[-bars:]
-
-
-def _cluster_order_levels(items: list[tuple[float, str]]) -> list[dict[str, Any]]:
-    counts: dict[tuple[str, float], int] = {}
-    for px, kind in items:
-        if px <= 0:
-            continue
-        key = (kind, round(px, 8))
-        counts[key] = counts.get(key, 0) + 1
-    levels = [{"kind": k, "price": p, "count": c} for (k, p), c in counts.items()]
-    levels.sort(key=lambda x: x["price"])
-    return levels
-
-
-def build_orders_chart_data(
-    qualified: list[TraderFills],
-    profiles: dict[str, dict[str, Any]],
-    mids: dict[str, float],
-    fetch_candles: bool = True,
-) -> dict[str, Any]:
-    coin_levels: dict[str, list[tuple[float, str]]] = {}
-    coin_accounts: dict[str, set[str]] = {}
-    total_orders = 0
-
-    for item in qualified:
-        t = item.trader
-        profile = profiles.get(t.address.lower()) or {}
-        entry_by_coin = _position_entry_map(profile)
-        orders_by_coin: dict[str, list[dict[str, Any]]] = {}
-        for o in profile.get("orders") or []:
-            if not isinstance(o, dict):
-                continue
-            coin_raw = str(o.get("coin", ""))
-            if not coin_raw:
-                continue
-            orders_by_coin.setdefault(coin_raw, []).append(o)
-
-        for coin_raw, orders in orders_by_coin.items():
-            total_orders += len(orders)
-            coin_accounts.setdefault(coin_raw, set()).add(t.address.lower())
-            levels = coin_levels.setdefault(coin_raw, [])
-            entry_px = entry_by_coin.get(coin_raw)
-            if entry_px and entry_px > 0:
-                levels.append((entry_px, "entry"))
-            for o in orders:
-                side = str(o.get("side", ""))
-                try:
-                    px = float(o.get("px", 0) or 0)
-                except (TypeError, ValueError):
-                    continue
-                if px <= 0:
-                    continue
-                if side == "買":
-                    levels.append((px, "buy"))
-                elif side == "賣":
-                    levels.append((px, "sell"))
-
-    coins = sorted(
-        coin_levels.keys(),
-        key=lambda c: (-len(coin_accounts.get(c, set())), c),
-    )
-
-    by_coin: dict[str, dict[str, Any]] = {}
-    candle_map: dict[str, list[list[float]]] = {}
-    if fetch_candles and coins:
-        print(f"  Fetching 4H candles for order charts ({len(coins)} coins)...")
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            candle_futures = {pool.submit(fetch_candles_chart, coin): coin for coin in coins}
-            for future in as_completed(candle_futures):
-                coin = candle_futures[future]
-                try:
-                    candle_map[coin] = future.result()
-                except Exception:
-                    candle_map[coin] = []
-
-    for coin in coins:
-        order_count = 0
-        for addr in coin_accounts.get(coin, set()):
-            prof = profiles.get(addr) or {}
-            order_count += sum(
-                1 for o in (prof.get("orders") or [])
-                if isinstance(o, dict) and str(o.get("coin", "")) == coin
-            )
-        by_coin[coin] = {
-            "mark": mids.get(coin, 0.0) or 0.0,
-            "accounts": len(coin_accounts.get(coin, set())),
-            "orders": order_count,
-            "levels": _cluster_order_levels(coin_levels.get(coin, [])),
-            "candles": candle_map.get(coin, []) if fetch_candles else [],
-        }
-
-    return {
-        "coins": coins,
-        "by_coin": by_coin,
-        "stats": {
-            "total_orders": total_orders,
-            "coin_count": len(coins),
-            "account_count": len(qualified),
-        },
-    }
-
-
-def _orders_chart_panel(chart_data: dict[str, Any]) -> str:
-    coins = chart_data.get("coins") or []
-    stats = chart_data.get("stats") or {}
-    if not coins:
-        return """
-        <p class="count">無當前委託</p>"""
-
-    tabs: list[str] = []
-    for i, coin in enumerate(coins):
-        acct_n = (chart_data.get("by_coin") or {}).get(coin, {}).get("accounts", 0)
-        active = " active" if i == 0 else ""
-        tabs.append(
-            f'<button type="button" class="order-coin-btn{active}" data-coin="{html.escape(coin)}">'
-            f'{html.escape(coin)} <span class="coin-acct">{acct_n}</span></button>'
-        )
-
-    return f"""
-        <p class="count" style="margin-bottom:8px">當前委託 · {stats.get("coin_count", 0)} 個標的（共 {stats.get("total_orders", 0)} 筆 · {stats.get("account_count", 0)} 個帳號）</p>
-        <div class="order-coin-tabs">{"".join(tabs)}</div>
-        <div class="order-chart-head">
-          <strong id="order-chart-title">{html.escape(coins[0])}</strong>
-          <div class="order-zoom-bar">
-            <button type="button" class="order-zoom-btn" id="order-zoom-out" title="縮小">−</button>
-            <input type="range" id="order-zoom-range" min="1" max="100" value="35" title="價格縮放">
-            <button type="button" class="order-zoom-btn" id="order-zoom-in" title="放大">+</button>
-            <button type="button" class="order-zoom-btn" id="order-zoom-focus">重設</button>
-          </div>
-          <span class="order-legend">
-            <span class="lg-entry">━ 開倉價</span>
-            <span class="lg-buy">━ 買單</span>
-            <span class="lg-sell">━ 賣單</span>
-            <span class="lg-mark">━ 現價</span>
-          </span>
-        </div>
-        <div class="order-chart-wrap" id="order-chart-wrap">
-          <svg id="order-chart-svg" viewBox="0 0 960 420" preserveAspectRatio="none"></svg>
-        </div>
-        <p class="count" style="margin-top:8px">4H K 線 · 僅顯示現價 ±50% 範圍內委託 · 滾輪可再縮放</p>"""
-
-
 def _consensus_rows(items: list[ConsensusTarget], mids: dict[str, float], window: str) -> str:
     rows: list[str] = []
     for i, c in enumerate(items, start=1):
@@ -1639,7 +1426,6 @@ def _unified_consensus_section(
     records_24h: list[OpenRecord],
     records_4h: list[OpenRecord],
     mids: dict[str, float],
-    orders_chart_panel: str,
 ) -> str:
     consensus_body = _consensus_rows(consensus_24h, mids, "24H") + _consensus_rows(consensus_4h, mids, "4H")
     if not consensus_body:
@@ -1681,7 +1467,6 @@ def _unified_consensus_section(
     <div class="subtabs">
       <button type="button" class="subtab active" data-subpanel="consensus-targets">共識標的</button>
       <button type="button" class="subtab" data-subpanel="consensus-trades">成交紀錄</button>
-      <button type="button" class="subtab" data-subpanel="consensus-orders">當前委託</button>
     </div>
     <div class="win-filter">
       <span class="count">時間窗：</span>
@@ -1713,9 +1498,6 @@ def _unified_consensus_section(
             <tbody>{unified_trade_rows()}</tbody>
           </table>
         </div>
-      </div>
-      <div id="consensus-orders" class="sub-panel">
-        {orders_chart_panel}
       </div>
     </div>
   </div>"""
@@ -1790,7 +1572,6 @@ def write_html_report(
         profiles = load_profiles_cache(cache_path)
     profiles = profiles or {}
     profiles_json = json.dumps(profiles, ensure_ascii=False).replace("</", "<\\/")
-    mids_json = json.dumps(mids, ensure_ascii=False).replace("</", "<\\/")
 
     account_rows: list[str] = []
     for i, item in enumerate(qualified, start=1):
@@ -1812,19 +1593,13 @@ def write_html_report(
             f"</tr>"
         )
 
-    orders_chart_data = build_orders_chart_data(qualified, profiles, mids)
-    orders_chart_json = json.dumps(orders_chart_data, ensure_ascii=False).replace("</", "<\\/")
-    orders_chart_panel = _orders_chart_panel(orders_chart_data)
-
     consensus_section = _unified_consensus_section(
         consensus_24h, consensus_4h, records_24h, records_4h, mids,
-        orders_chart_panel,
     )
 
     body = _build_report_html(
         generated, info_hosts, min_year_roi, qualified, records_24h, records_4h,
-        consensus_24h, consensus_4h, account_rows, consensus_section, profiles_json, mids_json,
-        orders_chart_json,
+        consensus_24h, consensus_4h, account_rows, consensus_section, profiles_json,
     )
 
     with open(path, "w", encoding="utf-8") as fh:
@@ -1843,8 +1618,6 @@ def _build_report_html(
     account_rows: list[str],
     consensus_section: str,
     profiles_json: str,
-    mids_json: str,
-    orders_chart_json: str,
 ) -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -1947,34 +1720,6 @@ def _build_report_html(
   .cg-dir {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; border: 1px solid; }}
   .cg-dir.long {{ color: #3fb950; border-color: #3fb950; background: rgba(63,185,80,0.1); }}
   .cg-dir.short {{ color: #f85149; border-color: #f85149; background: rgba(248,81,73,0.1); }}
-  .order-coin-tabs {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; max-height: 120px; overflow-y: auto; }}
-  .order-coin-btn {{
-    background: var(--card); border: 1px solid var(--border); color: var(--muted);
-    padding: 6px 10px; border-radius: 8px; cursor: pointer; font-size: 0.8125rem;
-  }}
-  .order-coin-btn.active {{ border-color: var(--accent); color: var(--accent); background: rgba(0,212,170,0.08); }}
-  .order-coin-btn .coin-acct {{ opacity: 0.65; font-size: 0.75rem; margin-left: 4px; }}
-  .order-chart-head {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; }}
-  .order-zoom-bar {{ display: flex; align-items: center; gap: 6px; }}
-  .order-zoom-btn {{
-    background: var(--card); border: 1px solid var(--border); color: var(--text);
-    width: 28px; height: 28px; border-radius: 6px; cursor: pointer; font-size: 0.9rem;
-  }}
-  .order-zoom-btn:not([id^="order-zoom-"]) {{ width: auto; padding: 0 10px; font-size: 0.75rem; }}
-  #order-zoom-focus {{ width: auto; padding: 0 10px; font-size: 0.75rem; }}
-  .order-zoom-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
-  #order-zoom-range {{ width: 110px; accent-color: var(--accent); cursor: pointer; }}
-  .order-legend {{ display: flex; gap: 14px; font-size: 0.75rem; color: var(--muted); flex-wrap: wrap; }}
-  .lg-entry {{ color: #fbbf24; }}
-  .lg-buy {{ color: var(--long); }}
-  .lg-sell {{ color: var(--short); }}
-  .lg-mark {{ color: var(--accent); }}
-  .order-chart-wrap {{
-    background: #161b22; border: 1px solid #21262d; border-radius: 8px;
-    padding: 8px 8px 4px; height: 420px; cursor: grab; touch-action: none;
-  }}
-  .order-chart-wrap.panning {{ cursor: grabbing; }}
-  .order-chart-wrap svg {{ width: 100%; height: 400px; }}
 </style>
 </head>
 <body>
@@ -2032,7 +1777,6 @@ def _build_report_html(
           <div class="cg-tabs">
             <button type="button" class="cg-tab active" data-cgtab="pos">倉位</button>
             <button type="button" class="cg-tab" data-cgtab="fills">交易</button>
-            <button type="button" class="cg-tab" data-cgtab="orders">當前委託(<span id="cg-ord-count">0</span>)</button>
             <button type="button" class="cg-tab" data-cgtab="ledger">充值 &amp; 提現</button>
             <button type="button" class="cg-tab" data-cgtab="spot">現貨持倉</button>
           </div>
@@ -2042,9 +1786,6 @@ def _build_report_html(
           <div class="cg-tab-panel" id="cg-tab-fills"><div class="cg-table-wrap"><table><thead><tr>
             <th>時間</th><th>代幣</th><th>方向</th><th>價格</th><th>數量</th><th>已實現PnL</th><th>手續費</th>
           </tr></thead><tbody id="cg-fill-body"></tbody></table></div></div>
-          <div class="cg-tab-panel" id="cg-tab-orders"><div class="cg-table-wrap"><table><thead><tr>
-            <th>代幣</th><th>方向</th><th>類型</th><th>開倉價</th><th>委託價</th><th>現價</th>
-          </tr></thead><tbody id="cg-ord-body"></tbody></table></div></div>
           <div class="cg-tab-panel" id="cg-tab-ledger"><div class="cg-table-wrap"><table><thead><tr>
             <th>時間</th><th>類型</th><th>金額</th><th>Hash</th>
           </tr></thead><tbody id="cg-ledger-body"></tbody></table></div></div>
@@ -2059,131 +1800,7 @@ def _build_report_html(
 
 <script>
 const PROFILES = {profiles_json};
-const MIDS = {mids_json};
-const ORDER_CHARTS = {orders_chart_json};
 let activeWindowFilter = 'all';
-let activeOrderCoin = null;
-let orderChartsReady = false;
-const orderChartViews = {{}};
-let orderChartPan = null;
-
-const ORDER_CHART_PAD = {{ W: 960, H: 420, L: 12, R: 138, T: 18, B: 30 }};
-
-function orderChartData(coin) {{
-  return (ORDER_CHARTS.by_coin || {{}})[coin];
-}}
-
-function computeOrderFullRange(data) {{
-  const candles = data.candles || [];
-  const levels = data.levels || [];
-  const mark = Number(data.mark) || 0;
-  let yMin = Infinity, yMax = -Infinity;
-  candles.forEach(c => {{ yMin = Math.min(yMin, c[3]); yMax = Math.max(yMax, c[2]); }});
-  levels.forEach(l => {{ yMin = Math.min(yMin, l.price); yMax = Math.max(yMax, l.price); }});
-  if (mark > 0) {{ yMin = Math.min(yMin, mark); yMax = Math.max(yMax, mark); }}
-  if (!isFinite(yMin)) {{ yMin = 0; yMax = 1; }}
-  const pad = (yMax - yMin) * 0.04 || Math.max(Math.abs(yMax), 1) * 0.02 || 1;
-  return {{ yMin: yMin - pad, yMax: yMax + pad }};
-}}
-
-function computeOrderMarkBand(data) {{
-  const mark = Number(data.mark) || 0;
-  if (mark > 0) {{
-    return {{ yMin: mark * 0.5, yMax: mark * 1.5, mark }};
-  }}
-  const candles = data.candles || [];
-  const recent = candles.slice(-24);
-  let rMin = Infinity, rMax = -Infinity;
-  recent.forEach(c => {{ rMin = Math.min(rMin, c[3]); rMax = Math.max(rMax, c[2]); }});
-  if (isFinite(rMin) && isFinite(rMax)) {{
-    const mid = (rMin + rMax) / 2;
-    return {{ yMin: mid * 0.5, yMax: mid * 1.5, mark: mid }};
-  }}
-  const full = computeOrderFullRange(data);
-  const mid = (full.yMin + full.yMax) / 2;
-  return {{ yMin: full.yMin, yMax: full.yMax, mark: mid }};
-}}
-
-function filterLevelsNearMark(data) {{
-  const mark = Number(data.mark) || 0;
-  const levels = data.levels || [];
-  if (mark <= 0) return levels;
-  const lo = mark * 0.5, hi = mark * 1.5;
-  return levels.filter(l => l.price >= lo && l.price <= hi);
-}}
-
-function ensureOrderChartView(coin, data) {{
-  if (!orderChartViews[coin]) {{
-    const band = computeOrderMarkBand(data);
-    orderChartViews[coin] = {{
-      yMin: band.yMin, yMax: band.yMax,
-      fullYMin: band.yMin, fullYMax: band.yMax,
-      mark: band.mark,
-      mode: 'mark50',
-    }};
-  }}
-  return orderChartViews[coin];
-}}
-
-function clampOrderView(view) {{
-  const span = view.yMax - view.yMin;
-  const minSpan = (view.fullYMax - view.fullYMin) * 0.008 || span * 0.05 || 1e-9;
-  if (span < minSpan) {{
-    const c = (view.yMin + view.yMax) / 2;
-    view.yMin = c - minSpan / 2;
-    view.yMax = c + minSpan / 2;
-  }}
-  if (view.yMin < view.fullYMin) {{
-    view.yMax += view.fullYMin - view.yMin;
-    view.yMin = view.fullYMin;
-  }}
-  if (view.yMax > view.fullYMax) {{
-    view.yMin -= view.yMax - view.fullYMax;
-    view.yMax = view.fullYMax;
-  }}
-  if (view.yMin < view.fullYMin) view.yMin = view.fullYMin;
-  if (view.yMax > view.fullYMax) view.yMax = view.fullYMax;
-}}
-
-function orderZoomFromSlider(val) {{
-  const coin = activeOrderCoin;
-  const data = orderChartData(coin);
-  if (!data) return;
-  const view = ensureOrderChartView(coin, data);
-  const fullSpan = view.fullYMax - view.fullYMin;
-  const t = Number(val) / 100;
-  const span = fullSpan * (0.98 - t * 0.93);
-  const anchor = Number(data.mark) > 0 ? Number(data.mark) : (view.yMin + view.yMax) / 2;
-  view.yMin = anchor - span / 2;
-  view.yMax = anchor + span / 2;
-  view.mode = 'custom';
-  clampOrderView(view);
-  drawOrderChart(coin);
-}}
-
-function syncOrderZoomSlider(coin) {{
-  const slider = document.getElementById('order-zoom-range');
-  const data = orderChartData(coin);
-  if (!slider || !data) return;
-  const view = ensureOrderChartView(coin, data);
-  const fullSpan = view.fullYMax - view.fullYMin;
-  const span = view.yMax - view.yMin;
-  const ratio = fullSpan > 0 ? span / fullSpan : 1;
-  slider.value = String(Math.round(Math.max(1, Math.min(100, (0.98 - ratio) / 0.93 * 100))));
-}}
-
-function layoutOrderLabels(items, yScale, chartTop, chartBottom) {{
-  const sorted = items.map(it => ({{ ...it, lineY: yScale(it.price) }}))
-    .sort((a, b) => a.lineY - b.lineY);
-  const minGap = 13;
-  let lastY = chartTop - minGap;
-  return sorted.map(it => {{
-    let labelY = Math.max(chartTop + 8, Math.min(chartBottom - 4, it.lineY));
-    if (labelY - lastY < minGap) labelY = lastY + minGap;
-    lastY = labelY;
-    return {{ ...it, labelY }};
-  }});
-}}
 
 function activeViewRoot() {{
   const panel = document.querySelector('.panel.active');
@@ -2206,27 +1823,6 @@ function fmtTime(ms) {{
   return new Date(ms).toISOString().replace('T', ' ').replace('.000Z', ' UTC');
 }}
 
-function fmtPx(v) {{
-  const n = Number(v) || 0;
-  if (n <= 0) return '—';
-  return n.toLocaleString(undefined, {{ minimumFractionDigits: 4, maximumFractionDigits: 4 }});
-}}
-
-function orderSideBadge(side) {{
-  const cls = side === '買' ? 'long' : side === '賣' ? 'short' : 'neutral';
-  return `<span class="badge ${{cls}}">${{side}}</span>`;
-}}
-
-function orderTypeZh(t, reduceOnly) {{
-  const map = {{
-    'Limit': '限價', 'Market': '市價', 'Stop Market': '止損市價', 'Stop Limit': '止損限價',
-    'Take Profit Market': '止盈市價', 'Take Profit Limit': '止盈限價', 'Stop': '止損',
-  }};
-  let label = map[t] || t || '—';
-  if (reduceOnly) label += '·只減';
-  return label;
-}}
-
 function applyWindowFilter(filter) {{
   activeWindowFilter = filter;
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === filter));
@@ -2234,189 +1830,6 @@ function applyWindowFilter(filter) {{
     const w = row.dataset.window || '';
     row.style.display = (filter === 'all' || w === filter) ? '' : 'none';
   }});
-}}
-
-function levelStyle(kind) {{
-  if (kind === 'entry') return {{ color: '#fbbf24', dash: '7,5', label: '開倉' }};
-  if (kind === 'buy') return {{ color: '#22c55e', dash: 'none', label: '買' }};
-  return {{ color: '#ef4444', dash: 'none', label: '賣' }};
-}}
-
-function drawOrderChart(coin) {{
-  const svg = document.getElementById('order-chart-svg');
-  const title = document.getElementById('order-chart-title');
-  if (!svg || !ORDER_CHARTS.by_coin) return;
-  const data = ORDER_CHARTS.by_coin[coin];
-  if (!data) return;
-  activeOrderCoin = coin;
-  if (title) title.textContent = coin;
-  const view = ensureOrderChartView(coin, data);
-  syncOrderZoomSlider(coin);
-
-  const {{ W, H, L: padL, R: padR, T: padT, B: padB }} = ORDER_CHART_PAD;
-  const chartW = W - padL - padR, chartH = H - padT - padB;
-  const candles = data.candles || [];
-  const levels = filterLevelsNearMark(data);
-  const mark = Number(data.mark) || 0;
-  const yMin = view.yMin, yMax = view.yMax;
-  const yScale = p => padT + chartH - ((p - yMin) / (yMax - yMin)) * chartH;
-
-  let out = `<rect x="0" y="0" width="${{W}}" height="${{H}}" fill="#161b22"/>`;
-  const labelX = W - 8;
-  const labelItems = [];
-  for (let i = 0; i < 6; i++) {{
-    const p = yMin + (yMax - yMin) * i / 5;
-    const y = yScale(p);
-    out += `<line x1="${{padL}}" y1="${{y}}" x2="${{padL + chartW}}" y2="${{y}}" stroke="#21262d" stroke-width="1"/>`;
-    labelItems.push({{ kind: 'grid', price: p, count: 0, st: {{ color: '#8b949e', label: '' }}, lineY: y }});
-  }}
-
-  const n = Math.max(candles.length, 1);
-  const step = chartW / n;
-  const cw = Math.max(2, step * 0.62);
-  candles.forEach((c, i) => {{
-    const x = padL + i * step + step / 2;
-    const o = c[1], h = c[2], l = c[3], cl = c[4];
-    if (h < yMin && l > yMax) return;
-    const up = cl >= o;
-    const color = up ? '#22c55e' : '#ef4444';
-    const yH = yScale(Math.min(h, yMax)), yL = yScale(Math.max(l, yMin));
-    if (yL - yH < 0.5) return;
-    out += `<line x1="${{x}}" y1="${{yH}}" x2="${{x}}" y2="${{yL}}" stroke="${{color}}" stroke-width="1"/>`;
-    const top = Math.min(yScale(o), yScale(cl)), bot = Math.max(yScale(o), yScale(cl));
-    out += `<rect x="${{x - cw / 2}}" y="${{top}}" width="${{cw}}" height="${{Math.max(1, bot - top)}}" fill="${{color}}"/>`;
-  }});
-
-  levels.forEach(l => {{
-    if (l.price < yMin || l.price > yMax) return;
-    const st = levelStyle(l.kind);
-    const y = yScale(l.price);
-    out += `<line x1="${{padL}}" y1="${{y}}" x2="${{padL + chartW}}" y2="${{y}}" stroke="${{st.color}}" stroke-width="1.5" stroke-dasharray="${{st.dash}}" opacity="0.9"/>`;
-    labelItems.push({{ ...l, st, lineY: y }});
-  }});
-
-  if (mark > 0 && mark >= yMin && mark <= yMax) {{
-    const y = yScale(mark);
-    out += `<line x1="${{padL}}" y1="${{y}}" x2="${{padL + chartW}}" y2="${{y}}" stroke="#00d4aa" stroke-width="2"/>`;
-    labelItems.push({{ kind: 'mark', price: mark, count: 0, st: {{ color: '#00d4aa', label: '現價' }}, lineY: y }});
-  }}
-
-  layoutOrderLabels(labelItems, yScale, padT, padT + chartH).forEach(it => {{
-    const st = it.st;
-    const marginX = padL + chartW;
-    if (Math.abs(it.labelY - it.lineY) > 2) {{
-      out += `<line x1="${{marginX}}" y1="${{it.lineY}}" x2="${{labelX - 4}}" y2="${{it.labelY - 4}}" stroke="${{st.color}}" stroke-width="1" opacity="0.55"/>`;
-    }}
-    const text = it.kind === 'grid'
-      ? fmtPx(it.price)
-      : `${{st.label}} ${{fmtPx(it.price)}}${{it.kind === 'mark' ? '' : ` ×${{it.count}}`}}`;
-    const fs = it.kind === 'grid' ? 10 : 11;
-    const fw = it.kind === 'mark' ? ' font-weight="700"' : '';
-    out += `<text x="${{labelX}}" y="${{it.labelY}}" text-anchor="end" fill="${{st.color}}" font-size="${{fs}}"${{fw}}>${{text}}</text>`;
-  }});
-
-  if (!candles.length) {{
-    out += `<text x="${{padL + 20}}" y="${{padT + 40}}" fill="#8b949e" font-size="13">無 K 線資料 · 仍顯示委託價位</text>`;
-  }}
-
-  svg.innerHTML = out;
-}}
-
-function zoomOrderChart(factor) {{
-  const coin = activeOrderCoin;
-  const data = orderChartData(coin);
-  if (!data) return;
-  const view = ensureOrderChartView(coin, data);
-  const center = Number(data.mark) > 0 ? Number(data.mark) : (view.yMin + view.yMax) / 2;
-  const span = (view.yMax - view.yMin) / factor;
-  view.yMin = center - span / 2;
-  view.yMax = center + span / 2;
-  view.mode = 'custom';
-  clampOrderView(view);
-  drawOrderChart(coin);
-}}
-
-function panOrderChart(deltaYpx) {{
-  const coin = activeOrderCoin;
-  const data = orderChartData(coin);
-  if (!data) return;
-  const view = ensureOrderChartView(coin, data);
-  const chartH = ORDER_CHART_PAD.H - ORDER_CHART_PAD.T - ORDER_CHART_PAD.B;
-  const span = view.yMax - view.yMin;
-  const deltaPrice = (deltaYpx / chartH) * span;
-  view.yMin += deltaPrice;
-  view.yMax += deltaPrice;
-  view.mode = 'custom';
-  clampOrderView(view);
-  drawOrderChart(coin);
-}}
-
-function resetOrderChartFocus() {{
-  const coin = activeOrderCoin;
-  const data = orderChartData(coin);
-  if (!data) return;
-  const band = computeOrderMarkBand(data);
-  orderChartViews[coin] = {{
-    yMin: band.yMin, yMax: band.yMax,
-    fullYMin: band.yMin, fullYMax: band.yMax,
-    mark: band.mark,
-    mode: 'mark50',
-  }};
-  drawOrderChart(coin);
-}}
-
-function initOrderCharts() {{
-  const coins = ORDER_CHARTS.coins || [];
-  if (!coins.length) return;
-
-  if (!orderChartsReady) {{
-    document.querySelectorAll('.order-coin-btn').forEach(btn => {{
-      btn.addEventListener('click', () => {{
-        document.querySelectorAll('.order-coin-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        drawOrderChart(btn.dataset.coin);
-      }});
-    }});
-
-    const wrap = document.getElementById('order-chart-wrap');
-    const zoomIn = document.getElementById('order-zoom-in');
-    const zoomOut = document.getElementById('order-zoom-out');
-    const zoomRange = document.getElementById('order-zoom-range');
-    const zoomFocus = document.getElementById('order-zoom-focus');
-
-    zoomIn?.addEventListener('click', () => zoomOrderChart(1.35));
-    zoomOut?.addEventListener('click', () => zoomOrderChart(1 / 1.35));
-    zoomRange?.addEventListener('input', e => orderZoomFromSlider(e.target.value));
-    zoomFocus?.addEventListener('click', resetOrderChartFocus);
-
-    wrap?.addEventListener('wheel', e => {{
-      e.preventDefault();
-      zoomOrderChart(e.deltaY < 0 ? 1.18 : 1 / 1.18);
-    }}, {{ passive: false }});
-
-    wrap?.addEventListener('mousedown', e => {{
-      orderChartPan = {{ y: e.clientY }};
-      wrap.classList.add('panning');
-    }});
-    window.addEventListener('mousemove', e => {{
-      if (!orderChartPan) return;
-      const dy = e.clientY - orderChartPan.y;
-      if (Math.abs(dy) > 0) {{
-        panOrderChart(dy);
-        orderChartPan.y = e.clientY;
-      }}
-    }});
-    window.addEventListener('mouseup', () => {{
-      orderChartPan = null;
-      wrap?.classList.remove('panning');
-    }});
-
-    orderChartsReady = true;
-  }}
-
-  const activeBtn = document.querySelector('.order-coin-btn.active');
-  const coin = activeBtn?.dataset.coin || coins[0];
-  drawOrderChart(coin);
 }}
 
 document.addEventListener('click', e => {{
@@ -2427,7 +1840,7 @@ document.addEventListener('click', e => {{
 
 function openProfile(addr) {{
   const p = PROFILES[(addr||'').toLowerCase()] || {{
-    address: addr, pnl: {{}}, chart: [], positions: [], orders: [], fills: [], ledger: [], spot_balances: []
+    address: addr, pnl: {{}}, chart: [], positions: [], fills: [], ledger: [], spot_balances: []
   }};
   const modal = document.getElementById('profile-modal');
   document.getElementById('cg-addr').textContent = addr;
@@ -2464,18 +1877,6 @@ function openProfile(addr) {{
      <td class="${{fmtPnlClass(f.closed_pnl)}}">${{fmtUsd(f.closed_pnl)}}</td>
      <td>${{fmtUsd(f.fee)}}</td></tr>`
   ).join('') || '<tr><td colspan="7">無交易</td></tr>';
-  const orders = p.orders || [];
-  const entryByCoin = {{}};
-  (p.positions || []).forEach(row => {{
-    const entry = Number(row.entry_px) || 0;
-    if (entry > 0) entryByCoin[row.coin] = entry;
-  }});
-  document.getElementById('cg-ord-count').textContent = orders.length;
-  document.getElementById('cg-ord-body').innerHTML = orders.map(o =>
-    `<tr><td>${{o.coin}}</td><td>${{orderSideBadge(o.side)}}</td><td>${{orderTypeZh(o.type, o.reduce_only)}}</td>
-     <td>${{fmtPx(entryByCoin[o.coin])}}</td>
-     <td>${{Number(o.px).toFixed(4)}}</td><td>${{fmtPx(MIDS[o.coin])}}</td></tr>`
-  ).join('') || '<tr><td colspan="6">無掛單</td></tr>';
   document.getElementById('cg-ledger-body').innerHTML = (p.ledger||[]).map(l =>
     `<tr><td>${{fmtTime(l.time)}}</td><td>${{l.type}}</td>
      <td class="${{fmtPnlClass(l.amount)}}">${{fmtUsd(l.amount)}}</td><td>${{l.hash||'—'}}</td></tr>`
@@ -2545,7 +1946,6 @@ document.querySelectorAll('#consensus .subtab').forEach(btn => {{
     btn.classList.add('active');
     const panel = document.getElementById(btn.dataset.subpanel);
     panel.classList.add('active');
-    if (btn.dataset.subpanel === 'consensus-orders') initOrderCharts();
   }});
 }});
 
@@ -2582,7 +1982,6 @@ document.querySelectorAll('table.sortable').forEach(table => {{
 }});
 
 applyWindowFilter('all');
-if (document.getElementById('consensus-orders')?.classList.contains('active')) initOrderCharts();
 </script>
 </body>
 </html>"""
