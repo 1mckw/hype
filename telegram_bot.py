@@ -422,7 +422,7 @@ def main() -> int:
 
     info_urls, info_auth = build_info_url_config(args.info_urls, args.goldrush_key or None)
     configure_info_urls(info_urls, info_auth)
-    configure_wr_days(7)
+    configure_wr_days(30)
     configure_min_year_roi(args.min_year_roi)
     configure_fills_cache(
         os.path.join(args.output_dir, FILLS_CACHE_FILE),

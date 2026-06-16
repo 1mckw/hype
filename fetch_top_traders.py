@@ -33,14 +33,15 @@ FILLS_CACHE_FILE = "fills_cache.json"
 PROFILES_CACHE_FILE = "profiles_cache.json"
 FILLS_CACHE_TTL_SEC = 1800
 CACHE_TTL_SEC = 600
-DEFAULT_WR_DAYS = 7
+DEFAULT_WR_DAYS = 30
 MAX_FILLS_PER_REQUEST = 2000
 MIN_YEAR_ROI = 1.5  # ROI > 150% (trailing 365D, or since inception if <365d)
 MIN_DAY_VOLUME_USD = 5_000
 MIN_WEEK_VOLUME_USD = 25_000
 MIN_ACCOUNT_VALUE_USD = 1_000
-MIN_FILLS_7D = 3             # must have >=3 fills in last 7d
+MIN_FILLS_30D = 3             # must have >=3 fills in last 30d
 MIN_HISTORY_DAYS = 30          # account must be open at least 30 days
+MAX_PEAK_DRAWDOWN = 0.50       # exclude if ever lost >= 50% from equity peak
 
 HOUR_MS = 3_600_000
 MINUTE_MS = 60_000
@@ -88,7 +89,7 @@ class TraderScore:
     closed_trades: int = 0
     score: float = 0.0
     platform: str = "Hyperliquid"
-    win_rate_source: str = "7d"
+    win_rate_source: str = "30d"
 
 
 @dataclass
@@ -413,23 +414,41 @@ def _hist_value_at(hist: list[list[Any]], ts: int) -> float | None:
         return None
 
 
-def year_roi_from_portfolio(address: str) -> tuple[float | None, int]:
-    """ROI from portfolio: trailing 365D if history >=365d, else since account inception."""
+def _max_drawdown_from_av_hist(av_hist: list[list[Any]]) -> float:
+    """Peak-to-trough drawdown on account value history (0.0–1.0)."""
+    peak = 0.0
+    max_dd = 0.0
+    for pt in av_hist:
+        try:
+            val = float(pt[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if val <= 0:
+            continue
+        if val > peak:
+            peak = val
+        if peak > 0:
+            max_dd = max(max_dd, (peak - val) / peak)
+    return max_dd
+
+
+def portfolio_stats(address: str) -> tuple[float | None, int, float]:
+    """Return (year_roi, history_days, max_peak_drawdown)."""
     raw = post_info({"type": "portfolio", "user": address})
     if not isinstance(raw, list):
-        return None, 0
+        return None, 0, 0.0
     blocks = {k: v for k, v in raw if isinstance(k, str)}
     block = blocks.get("allTime") or blocks.get("perpAllTime")
     if not block:
-        return None, 0
+        return None, 0, 0.0
     pnl_hist = block.get("pnlHistory") or []
     av_hist = block.get("accountValueHistory") or []
     if len(pnl_hist) < 2 or len(av_hist) < 2:
-        return None, 0
+        return None, 0, 0.0
     span_ms = int(pnl_hist[-1][0]) - int(pnl_hist[0][0])
     history_days = span_ms // DAY_MS
     if history_days < 1:
-        return None, history_days
+        return None, history_days, 0.0
     end_ts = int(pnl_hist[-1][0])
     if history_days >= 365:
         cutoff = end_ts - YEAR_MS
@@ -440,9 +459,16 @@ def year_roi_from_portfolio(address: str) -> tuple[float | None, int]:
         pnl_start = _hist_value_at(pnl_hist, int(pnl_hist[0][0]))
     pnl_now = float(pnl_hist[-1][1])
     if av_start is None or pnl_start is None or av_start <= 0:
-        return None, history_days
+        return None, history_days, 0.0
+    max_dd = _max_drawdown_from_av_hist(av_hist)
     time.sleep(0.03)
-    return (pnl_now - pnl_start) / av_start, history_days
+    return (pnl_now - pnl_start) / av_start, history_days, max_dd
+
+
+def year_roi_from_portfolio(address: str) -> tuple[float | None, int]:
+    """ROI from portfolio: trailing 365D if history >=365d, else since account inception."""
+    year_roi, history_days, _ = portfolio_stats(address)
+    return year_roi, history_days
 
 
 def fetch_fills_by_days(address: str, days: int | None = None) -> list[dict[str, Any]]:
@@ -485,7 +511,7 @@ def fetch_fills_by_days(address: str, days: int | None = None) -> list[dict[str,
 
 
 def fetch_fills_7d(address: str) -> list[dict[str, Any]]:
-    return fetch_fills_by_days(address, 7)
+    return fetch_fills_by_days(address, DEFAULT_WR_DAYS)
 
 
 def win_rate_from_fills(fills: list[dict[str, Any]]) -> tuple[float, int]:
@@ -537,18 +563,20 @@ def filter_fills_by_minutes(fills: list[dict[str, Any]], minutes: int) -> list[d
 
 def is_active_trader(
     fills: list[dict[str, Any]],
-    min_fills_7d: int = MIN_FILLS_7D,
+    min_fills: int = MIN_FILLS_30D,
+    lookback_days: int | None = None,
 ) -> bool:
-    """Active = >=3 fills in last 7d."""
+    """Active = >=3 fills in the configured lookback window (default 30d)."""
     if not fills:
         return False
-    week_cutoff = utc_now_ms() - 7 * DAY_MS
-    week_n = 0
+    days = lookback_days if lookback_days is not None else _wr_days
+    cutoff = utc_now_ms() - days * DAY_MS
+    recent_n = 0
     for fill in fills:
         ts = int(fill.get("time", 0) or 0)
-        if ts >= week_cutoff:
-            week_n += 1
-    return week_n >= min_fills_7d
+        if ts >= cutoff:
+            recent_n += 1
+    return recent_n >= min_fills
 
 
 def is_open_fill(direction: str) -> bool:
@@ -677,10 +705,12 @@ def analyze_trader(trader: TraderScore, *, attempts: int = 3) -> TraderFills | N
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
-            year_roi, history_days = year_roi_from_portfolio(trader.address)
+            year_roi, history_days, max_drawdown = portfolio_stats(trader.address)
             if history_days < MIN_HISTORY_DAYS:
                 return None
             if year_roi is None or year_roi < _min_year_roi:
+                return None
+            if max_drawdown >= MAX_PEAK_DRAWDOWN:
                 return None
             trader.year_roi = year_roi
             trader.history_days = history_days
@@ -780,7 +810,8 @@ def select_top_traders(
     fast: bool,
 ) -> list[TraderFills]:
     print(
-        f"[2/3] Scoring + parallel scan (7D active + account>={MIN_HISTORY_DAYS}d + ROI>{_min_year_roi:.0%}) ..."
+        f"[2/3] Scoring + parallel scan (30D active + account>={MIN_HISTORY_DAYS}d + ROI>{_min_year_roi:.0%} "
+        f"+ max DD<{MAX_PEAK_DRAWDOWN:.0%}) ..."
     )
     candidates: list[TraderScore] = []
     for row in rows:
@@ -955,7 +986,7 @@ def records_from_qualified_minutes(
 def write_accounts_csv(path: str, qualified: list[TraderFills]) -> None:
     fields = [
         "rank", "platform", "address", "display_name", "win_rate", "win_rate_source",
-        "closed_trades_7d", "year_roi", "history_days", "account_value_usd", "day_pnl", "day_roi", "day_volume",
+        "closed_trades_30d", "year_roi", "history_days", "account_value_usd", "day_pnl", "day_roi", "day_volume",
         "week_roi", "month_roi", "month_pnl", "alltime_pnl", "score",
     ]
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
@@ -967,7 +998,7 @@ def write_accounts_csv(path: str, qualified: list[TraderFills]) -> None:
                 "rank": i, "platform": t.platform, "address": t.address,
                 "display_name": t.display_name, "win_rate": f"{t.win_rate:.4f}",
                 "win_rate_source": t.win_rate_source,
-                "closed_trades_7d": t.closed_trades,
+                "closed_trades_30d": t.closed_trades,
                 "year_roi": f"{t.year_roi:.6f}",
                 "history_days": t.history_days,
                 "account_value_usd": f"{t.account_value:.2f}",
@@ -1949,7 +1980,7 @@ def _build_report_html(
 <body>
 <div class="wrap">
   <h1>Perp 活躍高 ROI 帳號</h1>
-  <p class="sub">產生時間：{html.escape(generated)} · Hyperliquid 免費 API · Info: {html.escape(info_hosts)} · 活躍：7D≥{MIN_FILLS_7D}筆 · 帳齡≥{MIN_HISTORY_DAYS}D · ROI&gt;{min_year_roi:.0%} · 點擊地址查看詳情</p>
+  <p class="sub">產生時間：{html.escape(generated)} · Hyperliquid 免費 API · Info: {html.escape(info_hosts)} · 活躍：30D≥{MIN_FILLS_30D}筆 · 帳齡≥{MIN_HISTORY_DAYS}D · ROI&gt;{min_year_roi:.0%} · 最大回撤&lt;{MAX_PEAK_DRAWDOWN:.0%} · 點擊地址查看詳情</p>
 
   <div class="stats">
     <div class="stat"><div class="label">帳號總數</div><div class="value">{len(qualified)}</div></div>
@@ -2583,7 +2614,7 @@ def html_from_csv(output_dir: str) -> None:
                 closed_trades=int(closed),
                 score=float(row["score"]),
                 platform=row.get("platform", "Hyperliquid"),
-                win_rate_source=row.get("win_rate_source", "7d"),
+                win_rate_source=row.get("win_rate_source", "30d"),
                 year_roi=float(row.get("year_roi") or 0),
                 history_days=int(row.get("history_days") or 0),
             )
@@ -2769,7 +2800,7 @@ def write_summary_txt(
         fh.write("Hyperliquid Top Active High-Win-Rate Accounts\n")
         fh.write(f"Generated: {utc_str(utc_now_ms())}\n")
         fh.write(f"Info URLs: {', '.join(_info_urls)}\n")
-        fh.write(f"Filter: active account (>= {MIN_FILLS_7D} fills in 7d)\n")
+        fh.write(f"Filter: active account (>= {MIN_FILLS_30D} fills in 30d)\n")
         fh.write(f"Filter: account age >= {MIN_HISTORY_DAYS} days (portfolio history)\n")
         fh.write(f"Filter: day volume >= ${MIN_DAY_VOLUME_USD:g}, week volume >= ${MIN_WEEK_VOLUME_USD:g}\n")
         fh.write("Filter: day/week ROI > 0, account value >= ${:g}\n".format(MIN_ACCOUNT_VALUE_USD))
@@ -2779,6 +2810,7 @@ def write_summary_txt(
             f"(trailing 365D if history>=365d, else since account inception)\n"
         )
         fh.write("Filter: all-time PnL > 0 (leaderboard allTime)\n")
+        fh.write(f"Filter: exclude peak drawdown >= {MAX_PEAK_DRAWDOWN:.0%}\n")
         fh.write(f"Consensus: min {MIN_CONSENSUS_ACCOUNTS} accounts per symbol\n")
         fh.write(
             f"Exclude MM: median(|closedPnl|) < ${MM_MEDIAN_ABS_PNL_USD:g}"
@@ -2816,7 +2848,7 @@ def main() -> int:
         default=MIN_YEAR_ROI,
         help="Min ROI (default: 1.5 = 150%%; trailing 365D or since inception if <365d)",
     )
-    parser.add_argument("--wr-days", type=int, default=DEFAULT_WR_DAYS, help="Win-rate lookback days (default: 7)")
+    parser.add_argument("--wr-days", type=int, default=DEFAULT_WR_DAYS, help="Win-rate lookback days (default: 30)")
     parser.add_argument("--min-closed", type=int, default=5)
     parser.add_argument("--scan-limit", type=int, default=2500)
     parser.add_argument("--workers", type=int, default=24, help="Parallel API workers (default: 24)")
