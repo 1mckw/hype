@@ -41,7 +41,7 @@ MIN_WEEK_VOLUME_USD = 25_000
 MIN_ACCOUNT_VALUE_USD = 1_000
 MIN_FILLS_30D = 3             # must have >=3 fills in last 30d
 MIN_HISTORY_DAYS = 30          # account must be open at least 30 days
-MAX_PEAK_DRAWDOWN = 0.50       # exclude if ever lost >= 50% from equity peak
+MAX_PEAK_DRAWDOWN = 1.0        # exclude if ever lost >= 100% from equity peak
 
 HOUR_MS = 3_600_000
 MINUTE_MS = 60_000
