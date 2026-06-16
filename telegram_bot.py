@@ -340,6 +340,7 @@ def watch_consensus(
     scan_kwargs: dict,
     *,
     min_year_roi: float = MIN_YEAR_ROI,
+    gha: bool = False,
     force: bool = False,
     force_24h: bool = False,
     force_bootstrap: bool = False,
@@ -350,6 +351,13 @@ def watch_consensus(
     now = utc_now_ms()
     bucket_4h = consensus_bucket(now, BUCKET_4H_MS)
     bucket_24h = consensus_bucket(now, BUCKET_24H_MS)
+    last_4h = state.get("last_consensus_4h_bucket")
+    last_24h = state.get("last_consensus_24h_bucket")
+    print(
+        f"  Buckets: now_4h={bucket_4h} last_4h={last_4h} · "
+        f"now_24h={bucket_24h} last_24h={last_24h} · "
+        f"initialized={state.get('initialized', False)} gha={gha} force={force}"
+    )
 
     if force_bootstrap:
         state = {
@@ -369,9 +377,6 @@ def watch_consensus(
             state["initialized"] = True
         print("  Force mode: sending consensus + HTML report now")
     else:
-        send_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
-        send_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
-
         if not state.get("initialized"):
             state = {
                 "initialized": True,
@@ -383,10 +388,20 @@ def watch_consensus(
             print("  First run: state bootstrapped, no alerts sent")
             return 0
 
-        if not send_4h and not send_24h:
-            print("  No consensus due")
-            return 0
+        if gha:
+            # GHA cron fires every 4 hours — treat each run as a 4H push.
+            # Bucket checks alone can skip 4H after manual --force runs.
+            send_4h = True
+            send_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
+            print(f"  GHA schedule: 4H=always, 24H due={send_24h}")
+        else:
+            send_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
+            send_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
+            if not send_4h and not send_24h:
+                print("  No consensus due")
+                return 0
 
+    print(f"  Will send: 4H={send_4h} 24H={send_24h} HTML=yes")
     print("Running full scan...")
     total, qualified, records_4h, records_24h = run_full_scan(output_dir, **scan_kwargs)
     consensus_4h = build_consensus(records_4h, "4H", total)
@@ -520,6 +535,7 @@ def main() -> int:
                 args.output_dir,
                 scan_kwargs,
                 min_year_roi=args.min_year_roi,
+                gha=args.gha,
                 force=args.force,
                 force_24h=args.force_24h,
             )
