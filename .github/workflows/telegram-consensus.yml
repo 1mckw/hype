@@ -31,34 +31,37 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Prepare output dir
+        run: mkdir -p output
+
       - name: Restore data caches
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             output/leaderboard_cache.json
             output/fills_cache.json
             output/profiles_cache.json
-          key: hl-data-v2-${{ hashFiles('output/leaderboard_cache.json', 'output/fills_cache.json', 'output/profiles_cache.json') }}
+          key: hl-data-v2
           restore-keys: |
-            hl-data-v2-
+            hl-data-v2
 
       - name: Restore telegram state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: output/telegram_state.json
-          key: hl-state-v2-${{ hashFiles('output/telegram_state.json') }}
+          key: hl-state-v2
           restore-keys: |
-            hl-state-v2-
+            hl-state-v2
 
       - name: Scan and push consensus + HTML report
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GOLDRUSH_API_KEY: ${{ secrets.GOLDRUSH_API_KEY }}
-          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
-          FORCE_24H: ${{ github.event_name == 'workflow_dispatch' && inputs.force_24h }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force && 'true' || 'false' }}
+          FORCE_24H: ${{ github.event_name == 'workflow_dispatch' && inputs.force_24h && 'true' || 'false' }}
         run: |
-          mkdir -p output
+          set -euo pipefail
           ARGS=(--gha --output-dir output --workers 8)
           if [ "$FORCE" = "true" ]; then ARGS+=(--force); fi
           if [ "$FORCE_24H" = "true" ]; then ARGS+=(--force-24h); fi
@@ -66,26 +69,28 @@ jobs:
 
       - name: Save data caches
         if: always()
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |
             output/leaderboard_cache.json
             output/fills_cache.json
             output/profiles_cache.json
-          key: hl-data-v2-${{ hashFiles('output/leaderboard_cache.json', 'output/fills_cache.json', 'output/profiles_cache.json') }}
+          key: hl-data-v2-${{ github.run_id }}
 
       - name: Save telegram state
         if: always()
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: output/telegram_state.json
-          key: hl-state-v2-${{ hashFiles('output/telegram_state.json') }}
+          key: hl-state-v2-${{ github.run_id }}
 
       - name: Upload telegram state artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: telegram-state
+          name: telegram-state-${{ github.run_id }}
           path: output/telegram_state.json
           if-no-files-found: ignore
           retention-days: 30

@@ -251,7 +251,7 @@ def format_consensus_top5(
         return "\n".join(lines)
 
     for i, item in enumerate(ranked[:top_n], start=1):
-        direction = format_direction_colored(item.consensus_direction)
+        direction = html.escape(format_direction_colored(item.consensus_direction))
         lines.append(
             f"{i}. <b>{html.escape(item.coin)}</b> · {direction} · 淨比例 <b>{item.net_ratio:.0%}</b>"
         )
@@ -410,43 +410,60 @@ def watch_consensus(
     telegram_24h = build_telegram_consensus(records_24h, total)
 
     sent = 0
+    errors: list[str] = []
+
     if send_4h:
-        send_telegram_message(format_consensus_top5(telegram_4h, window="4H"), token, chat_id)
-        state["last_consensus_4h_bucket"] = bucket_4h
-        sent += 1
-        print("  Sent 4H consensus TOP5")
+        try:
+            send_telegram_message(format_consensus_top5(telegram_4h, window="4H"), token, chat_id)
+            state["last_consensus_4h_bucket"] = bucket_4h
+            sent += 1
+            print("  Sent 4H consensus TOP5")
+        except Exception as exc:
+            errors.append(f"4H message: {exc}")
+            print(f"  ERROR 4H message: {exc}", file=sys.stderr)
 
     if send_24h:
-        send_telegram_message(format_consensus_top5(telegram_24h, window="24H"), token, chat_id)
-        state["last_consensus_24h_bucket"] = bucket_24h
+        try:
+            send_telegram_message(format_consensus_top5(telegram_24h, window="24H"), token, chat_id)
+            state["last_consensus_24h_bucket"] = bucket_24h
+            sent += 1
+            print("  Sent 24H consensus TOP5")
+        except Exception as exc:
+            errors.append(f"24H message: {exc}")
+            print(f"  ERROR 24H message: {exc}", file=sys.stderr)
+
+    try:
+        consensus_4h = build_consensus(records_4h, "4H", total)
+        consensus_24h = build_consensus(records_24h, "24H", total)
+        html_path = os.path.join(output_dir, HTML_REPORT_FILE)
+        write_html_report(
+            html_path,
+            qualified,
+            records_4h,
+            records_24h,
+            consensus_4h,
+            consensus_24h,
+            min_year_roi=min_year_roi,
+        )
+        size_kb = os.path.getsize(html_path) / 1024
+        print(f"  HTML report: {html_path} ({size_kb:.0f} KB)")
+        caption = f"Perp 高 ROI 帳號報告\n{utc_str(now)} · {total} 帳號"
+        send_telegram_document(html_path, token, chat_id, caption=caption)
         sent += 1
-        print("  Sent 24H consensus TOP5")
-
-    consensus_4h = build_consensus(records_4h, "4H", total)
-    consensus_24h = build_consensus(records_24h, "24H", total)
-    html_path = os.path.join(output_dir, HTML_REPORT_FILE)
-    write_html_report(
-        html_path,
-        qualified,
-        records_4h,
-        records_24h,
-        consensus_4h,
-        consensus_24h,
-        min_year_roi=min_year_roi,
-    )
-    size_kb = os.path.getsize(html_path) / 1024
-    print(f"  HTML report: {html_path} ({size_kb:.0f} KB)")
-
-    caption = f"📊 Perp 高 ROI 帳號報告\n{utc_str(now)} · {total} 帳號"
-    send_telegram_document(html_path, token, chat_id, caption=caption)
-    sent += 1
-    print("  Sent report.html")
+        print("  Sent report.html")
+    except Exception as exc:
+        errors.append(f"HTML report: {exc}")
+        print(f"  ERROR HTML report: {exc}", file=sys.stderr)
 
     state["initialized"] = True
     state["updated_at"] = utc_str(now)
     save_state(output_dir, state)
 
     print(f"  Done in {time.time() - t0:.0f}s · accounts={total} · messages={sent}")
+    if errors:
+        print(f"  WARN: partial failures: {'; '.join(errors)}", file=sys.stderr)
+        if sent == 0:
+            raise RuntimeError("; ".join(errors))
     return sent
 
 
