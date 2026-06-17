@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from dataclasses import dataclass
 from typing import Any
 
@@ -292,10 +293,14 @@ def send_telegram_document(
     chat_id: str,
     *,
     caption: str = "",
+    content_type: str = "application/octet-stream",
+    timeout_sec: int = 300,
 ) -> None:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
     fname = os.path.basename(file_path)
     boundary = uuid.uuid4().hex
+    file_size = os.path.getsize(file_path)
+    print(f"  Uploading {fname} ({file_size / 1024:.0f} KB)...")
 
     with open(file_path, "rb") as fh:
         file_bytes = fh.read()
@@ -313,7 +318,7 @@ def send_telegram_document(
     body.extend(
         f'Content-Disposition: form-data; name="document"; filename="{fname}"\r\n'.encode()
     )
-    body.extend(b"Content-Type: text/html\r\n\r\n")
+    body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
     body.extend(file_bytes)
     body.extend(f"\r\n--{boundary}--\r\n".encode())
 
@@ -324,13 +329,44 @@ def send_telegram_document(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
             result = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
+        detail = exc.read().decode("utf-8", "replace")[:500]
         raise RuntimeError(f"Telegram HTTP {exc.code}: {detail}") from exc
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API error: {result}")
+
+
+def _zip_html_for_telegram(html_path: str) -> str:
+    zip_path = f"{html_path}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(html_path, os.path.basename(html_path))
+    return zip_path
+
+
+def send_html_report(
+    html_path: str,
+    token: str,
+    chat_id: str,
+    *,
+    caption: str,
+) -> None:
+    """Send HTML report; zip first so Telegram upload stays under size/time limits."""
+    size_kb = os.path.getsize(html_path) / 1024
+    print(f"  HTML report: {html_path} ({size_kb:.0f} KB)")
+    zip_path = _zip_html_for_telegram(html_path)
+    try:
+        send_telegram_document(
+            zip_path,
+            token,
+            chat_id,
+            caption=caption,
+            content_type="application/zip",
+        )
+    finally:
+        if os.path.isfile(zip_path):
+            os.remove(zip_path)
 
 
 def watch_consensus(
@@ -444,13 +480,12 @@ def watch_consensus(
             consensus_4h,
             consensus_24h,
             min_year_roi=min_year_roi,
+            include_profiles=False,
         )
-        size_kb = os.path.getsize(html_path) / 1024
-        print(f"  HTML report: {html_path} ({size_kb:.0f} KB)")
         caption = f"Perp 高 ROI 帳號報告\n{utc_str(now)} · {total} 帳號"
-        send_telegram_document(html_path, token, chat_id, caption=caption)
+        send_html_report(html_path, token, chat_id, caption=caption)
         sent += 1
-        print("  Sent report.html")
+        print("  Sent report.html.zip")
     except Exception as exc:
         errors.append(f"HTML report: {exc}")
         print(f"  ERROR HTML report: {exc}", file=sys.stderr)
@@ -462,7 +497,8 @@ def watch_consensus(
     print(f"  Done in {time.time() - t0:.0f}s · accounts={total} · messages={sent}")
     if errors:
         print(f"  WARN: partial failures: {'; '.join(errors)}", file=sys.stderr)
-        if sent == 0:
+        html_failed = any(err.startswith("HTML report:") for err in errors)
+        if sent == 0 or html_failed:
             raise RuntimeError("; ".join(errors))
     return sent
 

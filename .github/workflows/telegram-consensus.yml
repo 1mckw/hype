@@ -86,6 +86,15 @@ jobs:
           path: output/telegram_state.json
           key: hl-state-v2-${{ github.run_id }}
 
+      - name: Upload HTML report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ github.run_id }}
+          path: output/report.html
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Upload telegram state artifact
         if: always()
         uses: actions/upload-artifact@v4

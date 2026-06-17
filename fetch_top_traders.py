@@ -1556,6 +1556,7 @@ def write_html_report(
     min_year_roi: float = MIN_YEAR_ROI,
     profiles: dict[str, dict[str, Any]] | None = None,
     fetch_profiles: bool = True,
+    include_profiles: bool = True,
 ) -> None:
     generated = utc_str(utc_now_ms())
     info_hosts = ", ".join(u.replace("https://", "") for u in _info_urls)
@@ -1563,7 +1564,9 @@ def write_html_report(
     out_dir = os.path.dirname(path) or "."
     cache_path = os.path.join(out_dir, PROFILES_CACHE_FILE)
 
-    if profiles is None and fetch_profiles and qualified:
+    if not include_profiles:
+        profiles = {}
+    elif profiles is None and fetch_profiles and qualified:
         addresses = [q.trader.address for q in qualified]
         print(f"  Fetching wallet profiles ({len(addresses)})...")
         profiles = fetch_profiles_batch(addresses, workers=12)
