@@ -31,17 +31,24 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Restore caches
+      - name: Restore data caches
         uses: actions/cache@v4
         with:
           path: |
             output/leaderboard_cache.json
             output/fills_cache.json
             output/profiles_cache.json
-            output/telegram_state.json
-          key: hl-cache-v1
+          key: hl-data-v2-${{ hashFiles('output/leaderboard_cache.json', 'output/fills_cache.json', 'output/profiles_cache.json') }}
           restore-keys: |
-            hl-cache-v1
+            hl-data-v2-
+
+      - name: Restore telegram state
+        uses: actions/cache@v4
+        with:
+          path: output/telegram_state.json
+          key: hl-state-v2-${{ hashFiles('output/telegram_state.json') }}
+          restore-keys: |
+            hl-state-v2-
 
       - name: Scan and push consensus + HTML report
         env:
@@ -51,12 +58,13 @@ jobs:
           FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
           FORCE_24H: ${{ github.event_name == 'workflow_dispatch' && inputs.force_24h }}
         run: |
+          mkdir -p output
           ARGS=(--gha --output-dir output --workers 8)
           if [ "$FORCE" = "true" ]; then ARGS+=(--force); fi
           if [ "$FORCE_24H" = "true" ]; then ARGS+=(--force-24h); fi
           python telegram_bot.py "${ARGS[@]}"
 
-      - name: Save caches
+      - name: Save data caches
         if: always()
         uses: actions/cache/save@v4
         with:
@@ -64,5 +72,20 @@ jobs:
             output/leaderboard_cache.json
             output/fills_cache.json
             output/profiles_cache.json
-            output/telegram_state.json
-          key: hl-cache-v1
+          key: hl-data-v2-${{ hashFiles('output/leaderboard_cache.json', 'output/fills_cache.json', 'output/profiles_cache.json') }}
+
+      - name: Save telegram state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: output/telegram_state.json
+          key: hl-state-v2-${{ hashFiles('output/telegram_state.json') }}
+
+      - name: Upload telegram state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-state
+          path: output/telegram_state.json
+          if-no-files-found: ignore
+          retention-days: 30

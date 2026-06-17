@@ -378,19 +378,21 @@ def watch_consensus(
         print("  Force mode: sending consensus + HTML report now")
     else:
         if not state.get("initialized"):
-            state = {
-                "initialized": True,
-                "last_consensus_4h_bucket": bucket_4h,
-                "last_consensus_24h_bucket": bucket_24h,
-                "bootstrapped_at": utc_str(now),
-            }
-            save_state(output_dir, state)
-            print("  First run: state bootstrapped, no alerts sent")
-            return 0
+            if gha:
+                state["initialized"] = True
+                print("  GHA first run: initialized, will send now")
+            else:
+                state = {
+                    "initialized": True,
+                    "last_consensus_4h_bucket": bucket_4h,
+                    "last_consensus_24h_bucket": bucket_24h,
+                    "bootstrapped_at": utc_str(now),
+                }
+                save_state(output_dir, state)
+                print("  First run: state bootstrapped, no alerts sent")
+                return 0
 
         if gha:
-            # GHA cron fires every 4 hours — treat each run as a 4H push.
-            # Bucket checks alone can skip 4H after manual --force runs.
             send_4h = True
             send_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
             print(f"  GHA schedule: 4H=always, 24H due={send_24h}")
@@ -404,23 +406,8 @@ def watch_consensus(
     print(f"  Will send: 4H={send_4h} 24H={send_24h} HTML=yes")
     print("Running full scan...")
     total, qualified, records_4h, records_24h = run_full_scan(output_dir, **scan_kwargs)
-    consensus_4h = build_consensus(records_4h, "4H", total)
-    consensus_24h = build_consensus(records_24h, "24H", total)
     telegram_4h = build_telegram_consensus(records_4h, total)
     telegram_24h = build_telegram_consensus(records_24h, total)
-
-    html_path = os.path.join(output_dir, HTML_REPORT_FILE)
-    write_html_report(
-        html_path,
-        qualified,
-        records_4h,
-        records_24h,
-        consensus_4h,
-        consensus_24h,
-        min_year_roi=min_year_roi,
-    )
-    size_kb = os.path.getsize(html_path) / 1024
-    print(f"  HTML report: {html_path} ({size_kb:.0f} KB)")
 
     sent = 0
     if send_4h:
@@ -435,11 +422,27 @@ def watch_consensus(
         sent += 1
         print("  Sent 24H consensus TOP5")
 
+    consensus_4h = build_consensus(records_4h, "4H", total)
+    consensus_24h = build_consensus(records_24h, "24H", total)
+    html_path = os.path.join(output_dir, HTML_REPORT_FILE)
+    write_html_report(
+        html_path,
+        qualified,
+        records_4h,
+        records_24h,
+        consensus_4h,
+        consensus_24h,
+        min_year_roi=min_year_roi,
+    )
+    size_kb = os.path.getsize(html_path) / 1024
+    print(f"  HTML report: {html_path} ({size_kb:.0f} KB)")
+
     caption = f"📊 Perp 高 ROI 帳號報告\n{utc_str(now)} · {total} 帳號"
     send_telegram_document(html_path, token, chat_id, caption=caption)
     sent += 1
     print("  Sent report.html")
 
+    state["initialized"] = True
     state["updated_at"] = utc_str(now)
     save_state(output_dir, state)
 
