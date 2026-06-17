@@ -12,7 +12,6 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-import zipfile
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,11 +36,13 @@ from fetch_top_traders import (
     select_top_traders,
     utc_now_ms,
     utc_str,
+    write_accounts_csv,
     write_html_report,
 )
 
 STATE_FILE = "telegram_state.json"
 HTML_REPORT_FILE = "report.html"
+ACCOUNTS_CSV_FILE = "top300_accounts.csv"
 POLL_INTERVAL_SEC = 4 * 60 * 60
 TOP_N = 5
 BUCKET_4H_MS = 4 * 3_600_000
@@ -196,6 +197,7 @@ def run_full_scan(
     if not qualified:
         raise RuntimeError("No qualified traders found")
 
+    write_accounts_csv(os.path.join(output_dir, ACCOUNTS_CSV_FILE), qualified)
     total = len(qualified)
     records_4h, records_24h = records_from_qualified(qualified)
     return total, qualified, records_4h, records_24h
@@ -338,13 +340,6 @@ def send_telegram_document(
         raise RuntimeError(f"Telegram API error: {result}")
 
 
-def _zip_html_for_telegram(html_path: str) -> str:
-    zip_path = f"{html_path}.zip"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.write(html_path, os.path.basename(html_path))
-    return zip_path
-
-
 def send_html_report(
     html_path: str,
     token: str,
@@ -352,21 +347,15 @@ def send_html_report(
     *,
     caption: str,
 ) -> None:
-    """Send HTML report; zip first so Telegram upload stays under size/time limits."""
     size_kb = os.path.getsize(html_path) / 1024
     print(f"  HTML report: {html_path} ({size_kb:.0f} KB)")
-    zip_path = _zip_html_for_telegram(html_path)
-    try:
-        send_telegram_document(
-            zip_path,
-            token,
-            chat_id,
-            caption=caption,
-            content_type="application/zip",
-        )
-    finally:
-        if os.path.isfile(zip_path):
-            os.remove(zip_path)
+    send_telegram_document(
+        html_path,
+        token,
+        chat_id,
+        caption=caption,
+        content_type="text/html",
+    )
 
 
 def watch_consensus(
@@ -441,7 +430,9 @@ def watch_consensus(
 
     print(f"  Will send: 4H={send_4h} 24H={send_24h} HTML=yes")
     print("Running full scan...")
-    total, qualified, records_4h, records_24h = run_full_scan(output_dir, **scan_kwargs)
+    total, qualified, records_4h, records_24h = run_full_scan(
+        output_dir, **scan_kwargs,
+    )
     telegram_4h = build_telegram_consensus(records_4h, total)
     telegram_24h = build_telegram_consensus(records_24h, total)
 
@@ -485,7 +476,7 @@ def watch_consensus(
         caption = f"Perp 高 ROI 帳號報告\n{utc_str(now)} · {total} 帳號"
         send_html_report(html_path, token, chat_id, caption=caption)
         sent += 1
-        print("  Sent report.html.zip")
+        print("  Sent report.html")
     except Exception as exc:
         errors.append(f"HTML report: {exc}")
         print(f"  ERROR HTML report: {exc}", file=sys.stderr)
@@ -554,7 +545,9 @@ def main() -> int:
         return 1
 
     if args.gha:
-        args.workers = min(args.workers, 8)
+        args.workers = min(args.workers, 12)
+        if args.scan_limit > 1500:
+            args.scan_limit = 1500
 
     info_urls, info_auth = build_info_url_config(args.info_urls, args.goldrush_key or None)
     configure_info_urls(info_urls, info_auth)
