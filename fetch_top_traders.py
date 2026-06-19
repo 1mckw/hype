@@ -830,10 +830,116 @@ def select_top_traders(
     return parallel_analyze(batch, workers, min_closed, target)
 
 
+def load_qualified_from_csv(path: str) -> list[TraderFills]:
+    qualified: list[TraderFills] = []
+    with open(path, encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            wr = row.get("win_rate") or row.get("win_rate_7d") or row.get("win_rate_30d") or "0"
+            closed = row.get("closed_trades_7d") or row.get("closed_trades_30d") or "0"
+            t = TraderScore(
+                address=row["address"],
+                display_name=row.get("display_name", ""),
+                account_value=float(row["account_value_usd"]),
+                day_pnl=float(row["day_pnl"]),
+                day_roi=float(row["day_roi"]),
+                day_volume=float(row["day_volume"]),
+                week_roi=float(row["week_roi"]),
+                month_roi=float(row["month_roi"]),
+                month_pnl=float(row.get("month_pnl") or 0),
+                alltime_pnl=float(row.get("alltime_pnl") or 0),
+                win_rate=float(wr),
+                closed_trades=int(closed),
+                score=float(row["score"]),
+                platform=row.get("platform", "Hyperliquid"),
+                win_rate_source=row.get("win_rate_source", "30d"),
+                year_roi=float(row.get("year_roi") or 0),
+                history_days=int(row.get("history_days") or 0),
+            )
+            qualified.append(
+                TraderFills(trader=t, fills=[], win_rate=t.win_rate, closed_trades=t.closed_trades)
+            )
+    return qualified
+
+
+def refresh_qualified_fills(
+    items: list[TraderFills],
+    workers: int,
+    min_closed: int,
+) -> list[TraderFills]:
+    """Re-fetch fills for a cached qualified list (skips leaderboard + portfolio scan)."""
+    qualified: list[TraderFills] = []
+    done = 0
+    total = len(items)
+
+    def work(item: TraderFills) -> TraderFills | None:
+        fills = fetch_fills_by_days(item.trader.address)
+        if not is_active_trader(fills):
+            return None
+        if is_suspected_market_maker(fills):
+            return None
+        win_rate, closed = win_rate_from_fills(fills)
+        if closed < min_closed:
+            return None
+        t = item.trader
+        t.win_rate = win_rate
+        t.closed_trades = closed
+        return TraderFills(trader=t, fills=fills, win_rate=win_rate, closed_trades=closed)
+
+    print(f"  Fast refresh fills for {total} cached accounts (workers={workers})...")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(work, item): item for item in items}
+        for future in as_completed(futures):
+            done += 1
+            if done % 50 == 0:
+                print(f"      Refresh {done}/{total}, qualified {len(qualified)}")
+            try:
+                result = future.result()
+            except Exception as exc:
+                print(f"      WARN refresh skip ({exc})")
+                continue
+            if result is not None:
+                qualified.append(result)
+
+    if _fills_cache_use and _fills_cache_path:
+        with _fills_cache_lock:
+            save_fills_cache(_fills_cache_path, _fills_cache, _wr_days)
+    qualified.sort(key=lambda x: (x.trader.year_roi, x.trader.score), reverse=True)
+    print(f"      Refresh done: {len(qualified)}/{total} still qualified")
+    return qualified
+
+
 def net_ratio(long_n: int, short_n: int, total: int) -> float:
     if total <= 0:
         return 0.0
     return max(long_n, short_n) / total
+
+
+def consensus_direction_from_actions(
+    open_long: int,
+    close_long: int,
+    open_short: int,
+    close_short: int,
+) -> str:
+    ranked = (
+        ("開多", open_long),
+        ("平多", close_long),
+        ("開空", open_short),
+        ("平空", close_short),
+    )
+    label, count = max(ranked, key=lambda pair: pair[1])
+    return label if count > 0 else "—"
+
+
+def net_ratio_from_actions(
+    open_long: int,
+    close_long: int,
+    open_short: int,
+    close_short: int,
+    total: int,
+) -> float:
+    if total <= 0:
+        return 0.0
+    return max(open_long, close_long, open_short, close_short) / total
 
 
 _mid_prices_cache: dict[str, float] | None = None
@@ -872,6 +978,10 @@ def build_consensus(records: list[OpenRecord], window: str, total_accounts: int)
         bucket = by_coin.get(coin)
         if bucket is None:
             bucket = {
+                "open_long": set(),
+                "open_short": set(),
+                "close_long": set(),
+                "close_short": set(),
                 "long_addr_wr": {},
                 "short_addr_wr": {},
                 "notional": 0.0,
@@ -880,6 +990,16 @@ def build_consensus(records: list[OpenRecord], window: str, total_accounts: int)
                 "wr_n": 0,
             }
             by_coin[coin] = bucket
+
+        dir_zh = format_direction_zh(r.direction)
+        if dir_zh == "開多":
+            bucket["open_long"].add(r.address)
+        elif dir_zh == "開空":
+            bucket["open_short"].add(r.address)
+        elif dir_zh == "平多":
+            bucket["close_long"].add(r.address)
+        elif dir_zh == "平空":
+            bucket["close_short"].add(r.address)
 
         if direction_side(r.direction) == "Long":
             bucket["long_addr_wr"][r.address] = r.win_rate
@@ -902,16 +1022,12 @@ def build_consensus(records: list[OpenRecord], window: str, total_accounts: int)
         if account_count < MIN_CONSENSUS_ACCOUNTS:
             continue
 
-        if long_n > short_n:
-            direction = "Long"
-        elif short_n > long_n:
-            direction = "Short"
-        elif long_n > 0:
-            direction = "Mixed"
-        else:
-            direction = "—"
-
-        nr = net_ratio(long_n, short_n, account_count)
+        ol = len(b["open_long"])
+        cl = len(b["close_long"])
+        os_ = len(b["open_short"])
+        cs = len(b["close_short"])
+        direction = consensus_direction_from_actions(ol, cl, os_, cs)
+        nr = net_ratio_from_actions(ol, cl, os_, cs, account_count)
 
         results.append(
             ConsensusTarget(
@@ -1103,13 +1219,22 @@ def _fmt_pct(val: float | str) -> str:
 def _dir_badge(direction: str) -> str:
     label = format_direction_zh(direction)
     d = html.escape(label)
-    side = direction_side(direction)
-    if side == "Long":
+    if label == "開多":
         cls = "long"
-    elif side == "Short":
+    elif label == "平多":
+        cls = "long"
+    elif label == "開空":
+        cls = "short"
+    elif label == "平空":
         cls = "short"
     else:
-        cls = "neutral"
+        side = direction_side(direction)
+        if side == "Long":
+            cls = "long"
+        elif side == "Short":
+            cls = "short"
+        else:
+            cls = "neutral"
     return f'<span class="badge {cls}">{d}</span>'
 
 
@@ -1409,7 +1534,7 @@ def _consensus_rows(items: list[ConsensusTarget], mids: dict[str, float], window
             f"<td>{html.escape(window)}</td>"
             f"<td><strong>{html.escape(c.coin)}</strong></td>"
             f"<td data-sort='{c.account_count}' class='wr'>{c.account_count}</td>"
-            f"<td>{_dir_badge(c.consensus_direction) if c.consensus_direction not in ('Mixed', '—') else html.escape(format_direction_zh(c.consensus_direction))}</td>"
+            f"<td>{_dir_badge(c.consensus_direction)}</td>"
             f"<td data-sort='{c.net_ratio:.6f}'>{c.net_ratio:.0%}</td>"
             f"<td data-sort='{c.long_accounts}'>{c.long_accounts}</td>"
             f"<td data-sort='{c.short_accounts}'>{c.short_accounts}</td>"

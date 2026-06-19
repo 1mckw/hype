@@ -28,10 +28,11 @@ from fetch_top_traders import (
     configure_info_urls,
     configure_min_year_roi,
     configure_wr_days,
+    consensus_direction_from_actions,
     direction_side,
     fetch_leaderboard,
     format_direction_zh,
-    net_ratio,
+    net_ratio_from_actions,
     records_from_qualified,
     select_top_traders,
     utc_now_ms,
@@ -76,23 +77,13 @@ def format_direction_colored(direction: str) -> str:
     return DIRECTION_EMOJI.get(zh, zh)
 
 
-def consensus_primary_direction(item: TelegramCoinConsensus) -> str:
-    ranked = (
-        ("開多", item.open_long),
-        ("平多", item.close_long),
-        ("開空", item.open_short),
-        ("平空", item.close_short),
-    )
-    return max(ranked, key=lambda pair: pair[1])[0]
-
-
 def sort_consensus_by_direction(
     consensus: list[TelegramCoinConsensus],
 ) -> list[TelegramCoinConsensus]:
     return sorted(
         consensus,
         key=lambda item: (
-            DIRECTION_ORDER.get(consensus_primary_direction(item), 99),
+            DIRECTION_ORDER.get(item.consensus_direction, 99),
             -item.account_count,
             item.coin,
         ),
@@ -143,14 +134,11 @@ def build_telegram_consensus(
         if account_count < MIN_CONSENSUS_ACCOUNTS:
             continue
 
-        if long_n > short_n:
-            direction = "Long"
-        elif short_n > long_n:
-            direction = "Short"
-        elif long_n > 0:
-            direction = "Mixed"
-        else:
-            direction = "—"
+        ol = len(bucket["open_long"])
+        cl = len(bucket["close_long"])
+        os_ = len(bucket["open_short"])
+        cs = len(bucket["close_short"])
+        direction = consensus_direction_from_actions(ol, cl, os_, cs)
 
         results.append(
             TelegramCoinConsensus(
@@ -158,12 +146,12 @@ def build_telegram_consensus(
                 account_count=account_count,
                 long_accounts=long_n,
                 short_accounts=short_n,
-                net_ratio=net_ratio(long_n, short_n, account_count),
+                net_ratio=net_ratio_from_actions(ol, cl, os_, cs, account_count),
                 consensus_direction=direction,
-                open_long=len(bucket["open_long"]),
-                open_short=len(bucket["open_short"]),
-                close_long=len(bucket["close_long"]),
-                close_short=len(bucket["close_short"]),
+                open_long=ol,
+                open_short=os_,
+                close_long=cl,
+                close_short=cs,
             )
         )
 
