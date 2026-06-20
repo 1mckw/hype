@@ -187,8 +187,8 @@ def run_full_scan(
 
     write_accounts_csv(os.path.join(output_dir, ACCOUNTS_CSV_FILE), qualified)
     total = len(qualified)
-    records_4h, records_24h = records_from_qualified(qualified)
-    return total, qualified, records_4h, records_24h
+    records_4h, records_24h, records_168h = records_from_qualified(qualified)
+    return total, qualified, records_4h, records_24h, records_168h
 
 
 def state_path(output_dir: str) -> str:
@@ -418,7 +418,7 @@ def watch_consensus(
 
     print(f"  Will send: 4H={send_4h} 24H={send_24h} HTML=yes")
     print("Running full scan...")
-    total, qualified, records_4h, records_24h = run_full_scan(
+    total, qualified, records_4h, records_24h, records_168h = run_full_scan(
         output_dir, **scan_kwargs,
     )
     telegram_4h = build_telegram_consensus(records_4h, total)
@@ -450,6 +450,7 @@ def watch_consensus(
     try:
         consensus_4h = build_consensus(records_4h, "4H", total)
         consensus_24h = build_consensus(records_24h, "24H", total)
+        consensus_168h = build_consensus(records_168h, "168H", total)
         html_path = os.path.join(output_dir, HTML_REPORT_FILE)
         write_html_report(
             html_path,
@@ -458,6 +459,8 @@ def watch_consensus(
             records_24h,
             consensus_4h,
             consensus_24h,
+            records_168h=records_168h,
+            consensus_168h=consensus_168h,
             min_year_roi=min_year_roi,
             include_profiles=False,
         )
