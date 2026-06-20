@@ -124,6 +124,10 @@ class ConsensusTarget:
     avg_long_wr: float = 0.0
     avg_short_wr: float = 0.0
     net_ratio: float = 0.0
+    open_long: int = 0
+    close_long: int = 0
+    open_short: int = 0
+    close_short: int = 0
 
 
 @dataclass
@@ -1044,6 +1048,10 @@ def build_consensus(records: list[OpenRecord], window: str, total_accounts: int)
                 avg_long_wr=_avg_wr_by_side(long_wr_map),
                 avg_short_wr=_avg_wr_by_side(short_wr_map),
                 net_ratio=nr,
+                open_long=ol,
+                close_long=cl,
+                open_short=os_,
+                close_short=cs,
             )
         )
 
@@ -1216,25 +1224,28 @@ def _fmt_pct(val: float | str) -> str:
         return str(val)
 
 
+def _direction_badge_cls(label: str) -> str:
+    if label == "開多":
+        return "long"
+    if label == "平多":
+        return "short"
+    if label == "開空":
+        return "short"
+    if label == "平空":
+        return "long"
+    return "neutral"
+
+
 def _dir_badge(direction: str) -> str:
     label = format_direction_zh(direction)
     d = html.escape(label)
-    if label == "開多":
-        cls = "long"
-    elif label == "平多":
-        cls = "long"
-    elif label == "開空":
-        cls = "short"
-    elif label == "平空":
-        cls = "short"
-    else:
+    cls = _direction_badge_cls(label)
+    if cls == "neutral":
         side = direction_side(direction)
         if side == "Long":
             cls = "long"
         elif side == "Short":
             cls = "short"
-        else:
-            cls = "neutral"
     return f'<span class="badge {cls}">{d}</span>'
 
 
@@ -1536,8 +1547,10 @@ def _consensus_rows(items: list[ConsensusTarget], mids: dict[str, float], window
             f"<td data-sort='{c.account_count}' class='wr'>{c.account_count}</td>"
             f"<td>{_dir_badge(c.consensus_direction)}</td>"
             f"<td data-sort='{c.net_ratio:.6f}'>{c.net_ratio:.0%}</td>"
-            f"<td data-sort='{c.long_accounts}'>{c.long_accounts}</td>"
-            f"<td data-sort='{c.short_accounts}'>{c.short_accounts}</td>"
+            f"<td data-sort='{c.open_long}'>{c.open_long}</td>"
+            f"<td data-sort='{c.close_long}'>{c.close_long}</td>"
+            f"<td data-sort='{c.open_short}'>{c.open_short}</td>"
+            f"<td data-sort='{c.close_short}'>{c.close_short}</td>"
             f"<td data-sort='{c.avg_entry_px:.8f}'>{c.avg_entry_px:,.4f}</td>"
             f"<td data-sort='{mark or 0}'>{_fmt_px(mark)}</td>"
             f"</tr>"
@@ -1554,7 +1567,7 @@ def _unified_consensus_section(
 ) -> str:
     consensus_body = _consensus_rows(consensus_24h, mids, "24H") + _consensus_rows(consensus_4h, mids, "4H")
     if not consensus_body:
-        consensus_body = "<tr><td colspan='10'>無共識標的</td></tr>"
+        consensus_body = "<tr><td colspan='12'>無共識標的</td></tr>"
 
     trade_items: list[tuple[OpenRecord, str]] = []
     for r in records_24h:
@@ -1606,7 +1619,7 @@ def _unified_consensus_section(
           <table class="sortable" id="consensus-table">
             <thead><tr>
               <th>#</th><th>時間窗</th><th>標的</th><th>帳號數</th><th>共識方向</th>
-              <th>淨比例</th><th>做多</th><th>做空</th><th>平均開倉價</th><th>現價</th>
+              <th>淨比例</th><th>開多</th><th>平多</th><th>開空</th><th>平空</th><th>平均開倉價</th><th>現價</th>
             </tr></thead>
             <tbody>{consensus_body}</tbody>
           </table>
