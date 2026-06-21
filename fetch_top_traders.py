@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fetch active high-win-rate Hyperliquid traders and export 4H / 24H / 168H open records.
+Fetch active high-win-rate Hyperliquid traders and export 4H / 24H / 72H open records.
 """
 
 from __future__ import annotations
@@ -918,32 +918,16 @@ def net_ratio(long_n: int, short_n: int, total: int) -> float:
     return max(long_n, short_n) / total
 
 
-def consensus_direction_from_actions(
-    open_long: int,
-    close_long: int,
-    open_short: int,
-    close_short: int,
-) -> str:
-    ranked = (
-        ("開多", open_long),
-        ("平多", close_long),
-        ("開空", open_short),
-        ("平空", close_short),
-    )
-    label, count = max(ranked, key=lambda pair: pair[1])
-    return label if count > 0 else "—"
+def consensus_direction_from_sides(long_side: int, short_side: int) -> str:
+    if long_side <= 0 and short_side <= 0:
+        return "—"
+    return "多" if long_side >= short_side else "空"
 
 
-def net_ratio_from_actions(
-    open_long: int,
-    close_long: int,
-    open_short: int,
-    close_short: int,
-    total: int,
-) -> float:
+def net_ratio_from_sides(long_side: int, short_side: int, total: int) -> float:
     if total <= 0:
         return 0.0
-    return max(open_long, close_long, open_short, close_short) / total
+    return max(long_side, short_side) / total
 
 
 _mid_prices_cache: dict[str, float] | None = None
@@ -1030,8 +1014,10 @@ def build_consensus(records: list[OpenRecord], window: str, total_accounts: int)
         cl = len(b["close_long"])
         os_ = len(b["open_short"])
         cs = len(b["close_short"])
-        direction = consensus_direction_from_actions(ol, cl, os_, cs)
-        nr = net_ratio_from_actions(ol, cl, os_, cs, account_count)
+        long_side = len(b["open_long"] | b["close_short"])
+        short_side = len(b["close_long"] | b["open_short"])
+        direction = consensus_direction_from_sides(long_side, short_side)
+        nr = net_ratio_from_sides(long_side, short_side, account_count)
 
         results.append(
             ConsensusTarget(
@@ -1085,13 +1071,13 @@ def build_direction_wr_ranks(
 def records_from_qualified(qualified: list[TraderFills]) -> tuple[list[OpenRecord], list[OpenRecord], list[OpenRecord]]:
     records_4h: list[OpenRecord] = []
     records_24h: list[OpenRecord] = []
-    records_168h: list[OpenRecord] = []
+    records_72h: list[OpenRecord] = []
     for rank, item in enumerate(qualified, start=1):
         trader = item.trader
         records_4h.extend(summarize_opens(trader, rank, "4H", filter_fills_by_hours(item.fills, 4)))
         records_24h.extend(summarize_opens(trader, rank, "24H", filter_fills_by_hours(item.fills, 24)))
-        records_168h.extend(summarize_opens(trader, rank, "168H", filter_fills_by_hours(item.fills, 168)))
-    return records_4h, records_24h, records_168h
+        records_72h.extend(summarize_opens(trader, rank, "72H", filter_fills_by_hours(item.fills, 72)))
+    return records_4h, records_24h, records_72h
 
 
 def records_from_qualified_minutes(
@@ -1227,14 +1213,10 @@ def _fmt_pct(val: float | str) -> str:
 
 
 def _direction_badge_cls(label: str) -> str:
-    if label == "開多":
+    if label in ("開多", "平空", "多", "開多+平空"):
         return "long"
-    if label == "平多":
+    if label in ("開空", "平多", "空", "開空+平多", "平多+開空"):
         return "short"
-    if label == "開空":
-        return "short"
-    if label == "平空":
-        return "long"
     return "neutral"
 
 
@@ -1546,10 +1528,9 @@ def _fmt_px_range(lo: float, hi: float) -> str:
     return f"{lo:,.4f} – {hi:,.4f}"
 
 
-def _consensus_rows(items: list[ConsensusTarget], mids: dict[str, float], window: str) -> str:
+def _consensus_rows(items: list[ConsensusTarget], window: str) -> str:
     rows: list[str] = []
     for i, c in enumerate(items, start=1):
-        mark = mids.get(c.coin)
         rows.append(
             f"<tr data-window=\"{html.escape(window)}\">"
             f"<td>{i}</td>"
@@ -1558,37 +1539,33 @@ def _consensus_rows(items: list[ConsensusTarget], mids: dict[str, float], window
             f"<td data-sort='{c.account_count}' class='wr'>{c.account_count}</td>"
             f"<td>{_dir_badge(c.consensus_direction)}</td>"
             f"<td data-sort='{c.net_ratio:.6f}'>{c.net_ratio:.0%}</td>"
-            f"<td data-sort='{c.open_long}'>{c.open_long}</td>"
-            f"<td data-sort='{c.close_long}'>{c.close_long}</td>"
-            f"<td data-sort='{c.open_short}'>{c.open_short}</td>"
-            f"<td data-sort='{c.close_short}'>{c.close_short}</td>"
-            f"<td data-sort='{c.avg_entry_px:.8f}'>{c.avg_entry_px:,.4f}</td>"
-            f"<td data-sort='{mark or 0}'>{_fmt_px(mark)}</td>"
+            f"<td data-sort='{c.open_long + c.close_short}'>{c.open_long}+{c.close_short}</td>"
+            f"<td data-sort='{c.close_long + c.open_short}'>{c.open_short}+{c.close_long}</td>"
             f"</tr>"
         )
     return "\n".join(rows)
 
 
 def _unified_consensus_section(
-    consensus_168h: list[ConsensusTarget],
+    consensus_72h: list[ConsensusTarget],
     consensus_24h: list[ConsensusTarget],
     consensus_4h: list[ConsensusTarget],
-    records_168h: list[OpenRecord],
+    records_72h: list[OpenRecord],
     records_24h: list[OpenRecord],
     records_4h: list[OpenRecord],
     mids: dict[str, float],
 ) -> str:
     consensus_body = (
-        _consensus_rows(consensus_168h, mids, "168H")
-        + _consensus_rows(consensus_24h, mids, "24H")
-        + _consensus_rows(consensus_4h, mids, "4H")
+        _consensus_rows(consensus_72h, "72H")
+        + _consensus_rows(consensus_24h, "24H")
+        + _consensus_rows(consensus_4h, "4H")
     )
     if not consensus_body:
-        consensus_body = "<tr><td colspan='12'>無共識標的</td></tr>"
+        consensus_body = "<tr><td colspan='8'>無共識標的</td></tr>"
 
     trade_items: list[tuple[OpenRecord, str]] = []
-    for r in records_168h:
-        trade_items.append((r, "168H"))
+    for r in records_72h:
+        trade_items.append((r, "72H"))
     for r in records_24h:
         trade_items.append((r, "24H"))
     for r in records_4h:
@@ -1617,8 +1594,8 @@ def _unified_consensus_section(
             )
         return "\n".join(rows) if rows else "<tr><td colspan='11'>無成交紀錄</td></tr>"
 
-    total_consensus = len(consensus_168h) + len(consensus_24h) + len(consensus_4h)
-    total_trades = len(records_168h) + len(records_24h) + len(records_4h)
+    total_consensus = len(consensus_72h) + len(consensus_24h) + len(consensus_4h)
+    total_trades = len(records_72h) + len(records_24h) + len(records_4h)
     return f"""
   <div id="consensus" class="panel active">
     <div class="subtabs">
@@ -1628,18 +1605,18 @@ def _unified_consensus_section(
     <div class="win-filter">
       <span class="count">時間窗：</span>
       <button type="button" class="filter-btn active" data-filter="all">全部</button>
-      <button type="button" class="filter-btn" data-filter="168H">168H</button>
+      <button type="button" class="filter-btn" data-filter="72H">72H</button>
       <button type="button" class="filter-btn" data-filter="24H">24H</button>
       <button type="button" class="filter-btn" data-filter="4H">4H</button>
     </div>
     <div class="subpanels">
       <div id="consensus-targets" class="sub-panel active">
-        <p class="count" style="margin-bottom:8px">共識標的 · {total_consensus} 個（168H {len(consensus_168h)} · 24H {len(consensus_24h)} · 4H {len(consensus_4h)}）</p>
+        <p class="count" style="margin-bottom:8px">共識標的 · {total_consensus} 個（72H {len(consensus_72h)} · 24H {len(consensus_24h)} · 4H {len(consensus_4h)}）</p>
         <div class="table-wrap">
           <table class="sortable" id="consensus-table">
             <thead><tr>
               <th>#</th><th>時間窗</th><th>標的</th><th>帳號數</th><th>共識方向</th>
-              <th>淨比例</th><th>開多</th><th>平多</th><th>開空</th><th>平空</th><th>平均開倉價</th><th>現價</th>
+              <th>淨比例</th><th>開多+平空</th><th>開空+平多</th>
             </tr></thead>
             <tbody>{consensus_body}</tbody>
           </table>
@@ -1711,15 +1688,15 @@ def write_html_report(
     records_24h: list[OpenRecord],
     consensus_4h: list[ConsensusTarget],
     consensus_24h: list[ConsensusTarget],
-    records_168h: list[OpenRecord] | None = None,
-    consensus_168h: list[ConsensusTarget] | None = None,
+    records_72h: list[OpenRecord] | None = None,
+    consensus_72h: list[ConsensusTarget] | None = None,
     min_year_roi: float = MIN_YEAR_ROI,
     profiles: dict[str, dict[str, Any]] | None = None,
     fetch_profiles: bool = True,
     include_profiles: bool = True,
 ) -> None:
-    records_168h = records_168h or []
-    consensus_168h = consensus_168h or []
+    records_72h = records_72h or []
+    consensus_72h = consensus_72h or []
     generated = utc_str(utc_now_ms())
     info_hosts = ", ".join(u.replace("https://", "") for u in _info_urls)
     mids = fetch_mid_prices(refresh=True)
@@ -1759,14 +1736,12 @@ def write_html_report(
         )
 
     consensus_section = _unified_consensus_section(
-        consensus_168h, consensus_24h, consensus_4h,
-        records_168h, records_24h, records_4h, mids,
+        consensus_72h, consensus_24h, consensus_4h,
+        records_72h, records_24h, records_4h, mids,
     )
 
     body = _build_report_html(
         generated, info_hosts, min_year_roi, qualified,
-        records_168h, records_24h, records_4h,
-        consensus_168h, consensus_24h, consensus_4h,
         account_rows, consensus_section, profiles_json,
     )
 
@@ -1779,12 +1754,6 @@ def _build_report_html(
     info_hosts: str,
     min_year_roi: float,
     qualified: list[TraderFills],
-    records_168h: list[OpenRecord],
-    records_24h: list[OpenRecord],
-    records_4h: list[OpenRecord],
-    consensus_168h: list[ConsensusTarget],
-    consensus_24h: list[ConsensusTarget],
-    consensus_4h: list[ConsensusTarget],
     account_rows: list[str],
     consensus_section: str,
     profiles_json: str,
@@ -1806,10 +1775,6 @@ def _build_report_html(
   .wrap {{ max-width: 1400px; margin: 0 auto; padding: 24px 16px 48px; }}
   h1 {{ font-size: 1.5rem; margin-bottom: 4px; }}
   .sub {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 20px; }}
-  .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }}
-  .stat {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }}
-  .stat .label {{ color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }}
-  .stat .value {{ font-size: 1.4rem; font-weight: 700; color: var(--accent); margin-top: 4px; }}
   .toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }}
   .tabs, .subtabs {{ display: flex; flex-wrap: wrap; gap: 6px; }}
   .tab, .subtab, .sort-toggle {{
@@ -1896,14 +1861,6 @@ def _build_report_html(
 <div class="wrap">
   <h1>Perp 活躍高 ROI 帳號</h1>
   <p class="sub">產生時間：{html.escape(generated)} · Hyperliquid 免費 API · Info: {html.escape(info_hosts)} · 活躍：30D≥{MIN_FILLS_30D}筆 · 帳齡≥{MIN_HISTORY_DAYS}D · ROI&gt;{min_year_roi:.0%} · 最大回撤&lt;{MAX_PEAK_DRAWDOWN:.0%} · 點擊地址查看詳情</p>
-
-  <div class="stats">
-    <div class="stat"><div class="label">帳號總數</div><div class="value">{len(qualified)}</div></div>
-    <div class="stat"><div class="label">168H 成交</div><div class="value">{len(records_168h)}</div></div>
-    <div class="stat"><div class="label">168H 共識</div><div class="value">{len(consensus_168h)}</div></div>
-    <div class="stat"><div class="label">24H 共識</div><div class="value">{len(consensus_24h)}</div></div>
-    <div class="stat"><div class="label">4H 共識</div><div class="value">{len(consensus_4h)}</div></div>
-  </div>
 
   <div class="toolbar">
     <div class="tabs main-tabs">
@@ -2481,12 +2438,12 @@ def main() -> int:
             print("No traders matched. Try --min-year-roi 0.5 or --scan-limit 3000")
             return 1
 
-        print("[3/3] Building 4H / 24H / 168H opens + consensus ...")
-        records_4h, records_24h, records_168h = records_from_qualified(qualified)
+        print("[3/3] Building 4H / 24H / 72H opens + consensus ...")
+        records_4h, records_24h, records_72h = records_from_qualified(qualified)
         total = len(qualified)
         consensus_4h = build_consensus(records_4h, "4H", total)
         consensus_24h = build_consensus(records_24h, "24H", total)
-        consensus_168h = build_consensus(records_168h, "168H", total)
+        consensus_72h = build_consensus(records_72h, "72H", total)
 
         write_accounts_csv(os.path.join(args.output_dir, "top300_accounts.csv"), qualified)
         write_trades_csv(os.path.join(args.output_dir, "trades_4h.csv"), records_4h)
@@ -2502,7 +2459,7 @@ def main() -> int:
         write_html_report(
             os.path.join(args.output_dir, "report.html"),
             qualified, records_4h, records_24h, consensus_4h, consensus_24h,
-            records_168h=records_168h, consensus_168h=consensus_168h,
+            records_72h=records_72h, consensus_72h=consensus_72h,
             min_year_roi=args.min_year_roi,
         )
 

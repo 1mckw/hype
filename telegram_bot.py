@@ -28,11 +28,11 @@ from fetch_top_traders import (
     configure_info_urls,
     configure_min_year_roi,
     configure_wr_days,
-    consensus_direction_from_actions,
+    consensus_direction_from_sides,
     direction_side,
     fetch_leaderboard,
     format_direction_zh,
-    net_ratio_from_actions,
+    net_ratio_from_sides,
     records_from_qualified,
     select_top_traders,
     utc_now_ms,
@@ -54,8 +54,10 @@ DIRECTION_EMOJI = {
     "開空": "🔴 開空",
     "平多": "🟠平多",
     "平空": "🔵平空",
+    "多": "🟢 多",
+    "空": "🔴 空",
 }
-DIRECTION_ORDER = {"開多": 0, "平多": 1, "開空": 2, "平空": 3}
+DIRECTION_ORDER = {"多": 0, "空": 1, "開多": 2, "平多": 3, "開空": 4, "平空": 5}
 
 
 @dataclass
@@ -138,7 +140,9 @@ def build_telegram_consensus(
         cl = len(bucket["close_long"])
         os_ = len(bucket["open_short"])
         cs = len(bucket["close_short"])
-        direction = consensus_direction_from_actions(ol, cl, os_, cs)
+        long_side = len(bucket["open_long"] | bucket["close_short"])
+        short_side = len(bucket["close_long"] | bucket["open_short"])
+        direction = consensus_direction_from_sides(long_side, short_side)
 
         results.append(
             TelegramCoinConsensus(
@@ -146,7 +150,7 @@ def build_telegram_consensus(
                 account_count=account_count,
                 long_accounts=long_n,
                 short_accounts=short_n,
-                net_ratio=net_ratio_from_actions(ol, cl, os_, cs, account_count),
+                net_ratio=net_ratio_from_sides(long_side, short_side, account_count),
                 consensus_direction=direction,
                 open_long=ol,
                 open_short=os_,
@@ -187,8 +191,8 @@ def run_full_scan(
 
     write_accounts_csv(os.path.join(output_dir, ACCOUNTS_CSV_FILE), qualified)
     total = len(qualified)
-    records_4h, records_24h, records_168h = records_from_qualified(qualified)
-    return total, qualified, records_4h, records_24h, records_168h
+    records_4h, records_24h, records_72h = records_from_qualified(qualified)
+    return total, qualified, records_4h, records_24h, records_72h
 
 
 def state_path(output_dir: str) -> str:
@@ -247,8 +251,8 @@ def format_consensus_top5(
             f"{i}. <b>{html.escape(item.coin)}</b> · {direction} · 淨比例 <b>{item.net_ratio:.0%}</b>"
         )
         lines.append(
-            f"   開多{item.open_long} · 開空{item.open_short} · "
-            f"平多{item.close_long} · 平空{item.close_short} · {item.account_count}帳號"
+            f"   開多+平空 {item.open_long}+{item.close_short} · "
+            f"開空+平多 {item.open_short}+{item.close_long} · {item.account_count}帳號"
         )
     return "\n".join(lines)
 
@@ -418,7 +422,7 @@ def watch_consensus(
 
     print(f"  Will send: 4H={send_4h} 24H={send_24h} HTML=yes")
     print("Running full scan...")
-    total, qualified, records_4h, records_24h, records_168h = run_full_scan(
+    total, qualified, records_4h, records_24h, records_72h = run_full_scan(
         output_dir, **scan_kwargs,
     )
     telegram_4h = build_telegram_consensus(records_4h, total)
@@ -450,7 +454,7 @@ def watch_consensus(
     try:
         consensus_4h = build_consensus(records_4h, "4H", total)
         consensus_24h = build_consensus(records_24h, "24H", total)
-        consensus_168h = build_consensus(records_168h, "168H", total)
+        consensus_72h = build_consensus(records_72h, "72H", total)
         html_path = os.path.join(output_dir, HTML_REPORT_FILE)
         write_html_report(
             html_path,
@@ -459,8 +463,8 @@ def watch_consensus(
             records_24h,
             consensus_4h,
             consensus_24h,
-            records_168h=records_168h,
-            consensus_168h=consensus_168h,
+            records_72h=records_72h,
+            consensus_72h=consensus_72h,
             min_year_roi=min_year_roi,
             include_profiles=False,
         )
