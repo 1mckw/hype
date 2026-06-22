@@ -21,7 +21,9 @@ from fetch_top_traders import (
     MIN_CONSENSUS_ACCOUNTS,
     MIN_YEAR_ROI,
     OpenRecord,
+    PositionChange,
     TraderFills,
+    WATCHLIST_FILE,
     build_consensus,
     build_info_url_config,
     configure_fills_cache,
@@ -34,7 +36,9 @@ from fetch_top_traders import (
     format_direction_zh,
     net_ratio_from_sides,
     records_from_qualified,
+    run_position_tracking,
     select_top_traders,
+    should_track_positions,
     utc_now_ms,
     utc_str,
     write_accounts_csv,
@@ -140,9 +144,8 @@ def build_telegram_consensus(
         cl = len(bucket["close_long"])
         os_ = len(bucket["open_short"])
         cs = len(bucket["close_short"])
-        long_side = len(bucket["open_long"] | bucket["close_short"])
-        short_side = len(bucket["close_long"] | bucket["open_short"])
-        direction = consensus_direction_from_sides(long_side, short_side)
+        open_accounts = len(bucket["open_long"] | bucket["open_short"])
+        direction = consensus_direction_from_sides(ol, os_)
 
         results.append(
             TelegramCoinConsensus(
@@ -150,7 +153,7 @@ def build_telegram_consensus(
                 account_count=account_count,
                 long_accounts=long_n,
                 short_accounts=short_n,
-                net_ratio=net_ratio_from_sides(long_side, short_side, account_count),
+                net_ratio=net_ratio_from_sides(ol, os_, open_accounts),
                 consensus_direction=direction,
                 open_long=ol,
                 open_short=os_,
@@ -175,7 +178,9 @@ def run_full_scan(
     workers: int = 24,
     fast: bool = True,
     use_cache: bool = True,
-) -> tuple[int, list[TraderFills], list[OpenRecord], list[OpenRecord]]:
+    watchlist_path: str = "",
+    track_positions: bool = False,
+) -> tuple[int, list[TraderFills], list[OpenRecord], list[OpenRecord], list[OpenRecord], list[PositionChange] | None]:
     os.makedirs(output_dir, exist_ok=True)
     rows = fetch_leaderboard(output_dir, use_cache=use_cache)
     qualified = select_top_traders(
@@ -192,7 +197,15 @@ def run_full_scan(
     write_accounts_csv(os.path.join(output_dir, ACCOUNTS_CSV_FILE), qualified)
     total = len(qualified)
     records_4h, records_24h, records_72h = records_from_qualified(qualified)
-    return total, qualified, records_4h, records_24h, records_72h
+
+    position_changes: list[PositionChange] | None = None
+    resolved_watchlist = watchlist_path or os.path.join(output_dir, WATCHLIST_FILE)
+    if should_track_positions(track_positions, resolved_watchlist):
+        position_changes = run_position_tracking(
+            output_dir, resolved_watchlist, workers=workers,
+        )
+
+    return total, qualified, records_4h, records_24h, records_72h, position_changes
 
 
 def state_path(output_dir: str) -> str:
@@ -251,8 +264,7 @@ def format_consensus_top5(
             f"{i}. <b>{html.escape(item.coin)}</b> · {direction} · 淨比例 <b>{item.net_ratio:.0%}</b>"
         )
         lines.append(
-            f"   開多+平空 {item.open_long}+{item.close_short} · "
-            f"開空+平多 {item.open_short}+{item.close_long} · {item.account_count}帳號"
+            f"   開多 {item.open_long} · 開空 {item.open_short} · {item.account_count}帳號"
         )
     return "\n".join(lines)
 
@@ -361,6 +373,8 @@ def watch_consensus(
     force: bool = False,
     force_24h: bool = False,
     force_bootstrap: bool = False,
+    watchlist_path: str = "",
+    track_positions: bool = False,
 ) -> int:
     print("Checking consensus schedule...")
     t0 = time.time()
@@ -422,8 +436,11 @@ def watch_consensus(
 
     print(f"  Will send: 4H={send_4h} 24H={send_24h} HTML=yes")
     print("Running full scan...")
-    total, qualified, records_4h, records_24h, records_72h = run_full_scan(
-        output_dir, **scan_kwargs,
+    total, qualified, records_4h, records_24h, records_72h, position_changes = run_full_scan(
+        output_dir,
+        watchlist_path=watchlist_path,
+        track_positions=track_positions,
+        **scan_kwargs,
     )
     telegram_4h = build_telegram_consensus(records_4h, total)
     telegram_24h = build_telegram_consensus(records_24h, total)
@@ -467,6 +484,7 @@ def watch_consensus(
             consensus_72h=consensus_72h,
             min_year_roi=min_year_roi,
             include_profiles=False,
+            position_changes=position_changes,
         )
         caption = f"Perp 高 ROI 帳號報告\n{utc_str(now)} · {total} 帳號"
         send_html_report(html_path, token, chat_id, caption=caption)
@@ -497,11 +515,16 @@ def run_loop(
     *,
     min_year_roi: float,
     interval_sec: int,
+    watchlist_path: str = "",
+    track_positions: bool = False,
 ) -> None:
     while True:
         try:
             watch_consensus(
-                token, chat_id, output_dir, scan_kwargs, min_year_roi=min_year_roi,
+                token, chat_id, output_dir, scan_kwargs,
+                min_year_roi=min_year_roi,
+                watchlist_path=watchlist_path,
+                track_positions=track_positions,
             )
         except Exception as exc:
             print(f"  ERROR: {exc}", file=sys.stderr)
@@ -532,6 +555,16 @@ def main() -> int:
     parser.add_argument(
         "--info-urls",
         default=os.environ.get("HL_INFO_URLS", "https://api.hyperliquid.xyz/info,https://api-ui.hyperliquid.xyz/info"),
+    )
+    parser.add_argument(
+        "--watchlist",
+        default="",
+        help="Watchlist file path (default: {output_dir}/watchlist.txt)",
+    )
+    parser.add_argument(
+        "--track-positions",
+        action="store_true",
+        help="Track position changes for watchlist addresses",
     )
     args = parser.parse_args()
 
@@ -564,11 +597,15 @@ def main() -> int:
         "use_cache": not args.no_cache,
     }
     interval_sec = max(5, args.interval_min) * 60
+    watchlist_path = args.watchlist or os.path.join(args.output_dir, WATCHLIST_FILE)
 
     try:
         if args.bootstrap:
             watch_consensus(
-                args.token, args.chat_id, args.output_dir, scan_kwargs, force_bootstrap=True,
+                args.token, args.chat_id, args.output_dir, scan_kwargs,
+                force_bootstrap=True,
+                watchlist_path=watchlist_path,
+                track_positions=args.track_positions,
             )
             return 0
 
@@ -582,13 +619,18 @@ def main() -> int:
                 gha=args.gha,
                 force=args.force,
                 force_24h=args.force_24h,
+                watchlist_path=watchlist_path,
+                track_positions=args.track_positions,
             )
             return 0
 
         print(f"Consensus + HTML bot started · poll every {interval_sec // 60} min")
         run_loop(
             args.token, args.chat_id, args.output_dir, scan_kwargs,
-            min_year_roi=args.min_year_roi, interval_sec=interval_sec,
+            min_year_roi=args.min_year_roi,
+            interval_sec=interval_sec,
+            watchlist_path=watchlist_path,
+            track_positions=args.track_positions,
         )
         return 0
     except KeyboardInterrupt:

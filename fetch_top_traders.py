@@ -31,6 +31,10 @@ GOLDRUSH_INFO_URL = "https://hypercore.goldrushdata.com/info"
 CACHE_FILE = "leaderboard_cache.json"
 FILLS_CACHE_FILE = "fills_cache.json"
 PROFILES_CACHE_FILE = "profiles_cache.json"
+POSITIONS_STATE_FILE = "positions_state.json"
+POSITIONS_SNAPSHOT_CSV = "positions_snapshot.csv"
+POSITION_CHANGES_CSV = "position_changes.csv"
+WATCHLIST_FILE = "watchlist.txt"
 FILLS_CACHE_TTL_SEC = 1800
 CACHE_TTL_SEC = 600
 DEFAULT_WR_DAYS = 30
@@ -146,6 +150,21 @@ class TraderFills:
     fills: list[dict[str, Any]]
     win_rate: float
     closed_trades: int
+
+
+@dataclass
+class PositionChange:
+    address: str
+    label: str
+    coin: str
+    change_type: str
+    prev_size: float
+    curr_size: float
+    prev_side: str
+    curr_side: str
+    value: float
+    upnl: float
+    scanned_at: str
 
 
 def utc_now_ms() -> int:
@@ -1014,10 +1033,9 @@ def build_consensus(records: list[OpenRecord], window: str, total_accounts: int)
         cl = len(b["close_long"])
         os_ = len(b["open_short"])
         cs = len(b["close_short"])
-        long_side = len(b["open_long"] | b["close_short"])
-        short_side = len(b["close_long"] | b["open_short"])
-        direction = consensus_direction_from_sides(long_side, short_side)
-        nr = net_ratio_from_sides(long_side, short_side, account_count)
+        open_accounts = len(b["open_long"] | b["open_short"])
+        direction = consensus_direction_from_sides(ol, os_)
+        nr = net_ratio_from_sides(ol, os_, open_accounts)
 
         results.append(
             ConsensusTarget(
@@ -1297,6 +1315,257 @@ def _parse_position_row(pos_wrap: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _positions_from_clearinghouse(ch: Any) -> dict[str, dict[str, Any]]:
+    positions: dict[str, dict[str, Any]] = {}
+    if isinstance(ch, dict):
+        for wrap in ch.get("assetPositions") or []:
+            row = _parse_position_row(wrap)
+            if row:
+                positions[row["coin"]] = row
+    return positions
+
+
+def fetch_positions(address: str) -> dict[str, dict[str, Any]]:
+    try:
+        ch = post_info({"type": "clearinghouseState", "user": address})
+    except Exception:
+        return {}
+    time.sleep(0.05)
+    return _positions_from_clearinghouse(ch)
+
+
+def fetch_positions_batch(
+    addresses: list[str],
+    workers: int = 12,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    if not addresses:
+        return result
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_positions, addr): addr for addr in addresses}
+        for future in as_completed(futures):
+            addr = futures[future]
+            try:
+                result[addr.lower()] = future.result()
+            except Exception:
+                result[addr.lower()] = {}
+    return result
+
+
+def load_watchlist(path: str) -> list[tuple[str, str]]:
+    if not os.path.isfile(path):
+        return []
+    entries: list[tuple[str, str]] = []
+    with open(path, encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "#" in line:
+                line = line[: line.index("#")].strip()
+            parts = line.split(",", 1)
+            addr = parts[0].strip()
+            label = parts[1].strip() if len(parts) > 1 else ""
+            if addr.lower().startswith("0x") and len(addr) >= 42:
+                entries.append((addr, label))
+    return entries
+
+
+def positions_state_path(output_dir: str) -> str:
+    return os.path.join(output_dir, POSITIONS_STATE_FILE)
+
+
+def load_positions_state(output_dir: str) -> dict[str, Any]:
+    path = positions_state_path(output_dir)
+    if not os.path.isfile(path):
+        return {"addresses": {}}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {"addresses": {}}
+
+
+def save_positions_state(output_dir: str, state: dict[str, Any]) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    with open(positions_state_path(output_dir), "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+
+
+def diff_positions(
+    address: str,
+    label: str,
+    prev: dict[str, dict[str, Any]],
+    curr: dict[str, dict[str, Any]],
+    scanned_at: str,
+) -> list[PositionChange]:
+    changes: list[PositionChange] = []
+    for coin in sorted(set(prev.keys()) | set(curr.keys())):
+        p = prev.get(coin)
+        c = curr.get(coin)
+        if p is None and c is not None:
+            change_type = "新开"
+        elif p is not None and c is None:
+            change_type = "平仓"
+        elif p is not None and c is not None:
+            if p["side"] != c["side"]:
+                change_type = "翻向"
+            elif c["size"] > p["size"] + 1e-12:
+                change_type = "加仓"
+            elif c["size"] < p["size"] - 1e-12:
+                change_type = "减仓"
+            else:
+                continue
+        else:
+            continue
+        curr_pos = c or p or {}
+        changes.append(
+            PositionChange(
+                address=address,
+                label=label,
+                coin=coin,
+                change_type=change_type,
+                prev_size=float(p["size"]) if p else 0.0,
+                curr_size=float(c["size"]) if c else 0.0,
+                prev_side=str(p["side"]) if p else "",
+                curr_side=str(c["side"]) if c else "",
+                value=float(curr_pos.get("value", 0) or 0),
+                upnl=float(curr_pos.get("upnl", 0) or 0),
+                scanned_at=scanned_at,
+            )
+        )
+    return changes
+
+
+def track_position_changes(
+    watchlist: list[tuple[str, str]],
+    output_dir: str,
+    workers: int = 12,
+) -> tuple[list[PositionChange], dict[str, Any]]:
+    state = load_positions_state(output_dir)
+    prev_addrs = state.get("addresses") or {}
+    if not isinstance(prev_addrs, dict):
+        prev_addrs = {}
+
+    addresses = [addr for addr, _ in watchlist]
+    labels = {addr.lower(): label for addr, label in watchlist}
+    current = fetch_positions_batch(addresses, workers=workers)
+    scanned_at = utc_str(utc_now_ms())
+    changes: list[PositionChange] = []
+    new_addrs: dict[str, Any] = {}
+
+    for addr in addresses:
+        addr_l = addr.lower()
+        curr_positions = current.get(addr_l, {})
+        label = labels.get(addr_l, "")
+        prev_entry = prev_addrs.get(addr_l)
+        if isinstance(prev_entry, dict) and prev_entry.get("positions") is not None:
+            prev_positions = prev_entry.get("positions") or {}
+            if isinstance(prev_positions, dict):
+                changes.extend(
+                    diff_positions(addr, label, prev_positions, curr_positions, scanned_at)
+                )
+        new_addrs[addr_l] = {"label": label, "positions": curr_positions}
+
+    new_state = {"updated_at": scanned_at, "addresses": new_addrs}
+    save_positions_state(output_dir, new_state)
+    return changes, new_state
+
+
+def write_positions_snapshot_csv(path: str, state: dict[str, Any], scanned_at: str) -> None:
+    fieldnames = [
+        "address", "label", "coin", "side", "size", "value", "entry_px",
+        "upnl", "roe", "leverage", "scanned_at",
+    ]
+    rows: list[dict[str, Any]] = []
+    addresses = state.get("addresses") or {}
+    if isinstance(addresses, dict):
+        for addr_l, entry in addresses.items():
+            if not isinstance(entry, dict):
+                continue
+            label = str(entry.get("label") or "")
+            positions = entry.get("positions") or {}
+            if not isinstance(positions, dict):
+                continue
+            for coin, pos in sorted(positions.items()):
+                if not isinstance(pos, dict):
+                    continue
+                rows.append({
+                    "address": addr_l,
+                    "label": label,
+                    "coin": coin,
+                    "side": pos.get("side", ""),
+                    "size": pos.get("size", 0),
+                    "value": pos.get("value", 0),
+                    "entry_px": pos.get("entry_px", 0),
+                    "upnl": pos.get("upnl", 0),
+                    "roe": pos.get("roe", 0),
+                    "leverage": pos.get("leverage", 0),
+                    "scanned_at": scanned_at,
+                })
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_position_changes_csv(path: str, changes: list[PositionChange]) -> None:
+    fieldnames = [
+        "address", "label", "coin", "change_type", "prev_side", "curr_side",
+        "prev_size", "curr_size", "value", "upnl", "scanned_at",
+    ]
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for c in changes:
+            writer.writerow({
+                "address": c.address,
+                "label": c.label,
+                "coin": c.coin,
+                "change_type": c.change_type,
+                "prev_side": c.prev_side,
+                "curr_side": c.curr_side,
+                "prev_size": c.prev_size,
+                "curr_size": c.curr_size,
+                "value": c.value,
+                "upnl": c.upnl,
+                "scanned_at": c.scanned_at,
+            })
+
+
+def should_track_positions(explicit: bool, watchlist_path: str) -> bool:
+    if explicit:
+        return True
+    return bool(load_watchlist(watchlist_path))
+
+
+def run_position_tracking(
+    output_dir: str,
+    watchlist_path: str,
+    *,
+    workers: int = 12,
+) -> list[PositionChange]:
+    watchlist = load_watchlist(watchlist_path)
+    if not watchlist:
+        return []
+    print(f"  Tracking positions for {len(watchlist)} watchlist address(es)...")
+    changes, state = track_position_changes(watchlist, output_dir, workers=workers)
+    scanned_at = str(state.get("updated_at") or utc_str(utc_now_ms()))
+    write_positions_snapshot_csv(
+        os.path.join(output_dir, POSITIONS_SNAPSHOT_CSV), state, scanned_at,
+    )
+    write_position_changes_csv(os.path.join(output_dir, POSITION_CHANGES_CSV), changes)
+    if changes:
+        addrs = len({c.address for c in changes})
+        print(f"  Position changes: {len(changes)} ({addrs} addresses)")
+    else:
+        print("  Position changes: none (bootstrap or no delta)")
+    return changes
+
+
 def fetch_address_profile(address: str) -> dict[str, Any]:
     """Fetch Coinglass-style wallet snapshot for HTML modal."""
     profile: dict[str, Any] = {
@@ -1338,16 +1607,12 @@ def fetch_address_profile(address: str) -> dict[str, Any]:
             profile["withdrawable"] = float(ch.get("withdrawable", 0) or 0)
         except (TypeError, ValueError):
             pass
-        positions: list[dict[str, Any]] = []
-        lev_sum = 0.0
-        for wrap in ch.get("assetPositions") or []:
-            row = _parse_position_row(wrap)
-            if row:
-                positions.append(row)
-                lev_sum += row["leverage"]
-        profile["positions"] = positions
+        positions = _positions_from_clearinghouse(ch)
+        profile["positions"] = list(positions.values())
         profile["position_count"] = len(positions)
-        profile["leverage"] = lev_sum / len(positions) if positions else 0.0
+        profile["leverage"] = (
+            sum(p["leverage"] for p in positions.values()) / len(positions) if positions else 0.0
+        )
 
     if isinstance(spot, dict):
         spot_usd = 0.0
@@ -1497,21 +1762,23 @@ def save_profiles_cache(path: str, profiles: dict[str, dict[str, Any]]) -> None:
         json.dump(profiles, fh, ensure_ascii=False)
 
 
+COINGLASS_HL_ADDR_URL = "https://www.coinglass.com/hyperliquid/"
+
+
+def _coinglass_addr_url(address: str) -> str:
+    return f"{COINGLASS_HL_ADDR_URL}{html.escape(address)}"
+
+
 def _addr_link(address: str, platform: str = "Hyperliquid") -> str:
     short = f"{address[:6]}...{address[-4:]}"
     return (
-        f'<button type="button" class="addr-btn" data-address="{html.escape(address)}" '
-        f'title="{html.escape(address)}">{html.escape(short)}</button>'
+        f'<a href="{_coinglass_addr_url(address)}" target="_blank" rel="noopener" '
+        f'title="{html.escape(address)}">{html.escape(short)}</a>'
     )
 
 
 def _addr_explorer_link(address: str) -> str:
-    short = f"{address[:6]}...{address[-4:]}"
-    url = f"https://app.hyperliquid.xyz/explorer/address/{html.escape(address)}"
-    return (
-        f'<a href="{url}" target="_blank" rel="noopener" '
-        f'title="{html.escape(address)}">{html.escape(short)}</a>'
-    )
+    return _addr_link(address)
 
 
 def _fmt_px(val: float | None) -> str:
@@ -1528,22 +1795,79 @@ def _fmt_px_range(lo: float, hi: float) -> str:
     return f"{lo:,.4f} – {hi:,.4f}"
 
 
-def _consensus_rows(items: list[ConsensusTarget], window: str) -> str:
+def _consensus_dir_attr(direction: str) -> str:
+    label = format_direction_zh(direction)
+    cls = _direction_badge_cls(label)
+    if cls == "long":
+        return 'data-dir="long"'
+    if cls == "short":
+        return 'data-dir="short"'
+    side = direction_side(direction)
+    if side == "Long":
+        return 'data-dir="long"'
+    if side == "Short":
+        return 'data-dir="short"'
+    return ""
+
+
+def _ratio_bar_html(open_long: int, open_short: int) -> str:
+    total = open_long + open_short
+    if total <= 0:
+        return '<span class="muted">—</span>'
+    long_pct = open_long / total * 100
+    short_pct = 100 - long_pct
+    return (
+        f'<div class="ratio-wrap" title="開多 {open_long} · 開空 {open_short}">'
+        f'<div class="ratio-bar">'
+        f'<span class="ratio-long" style="width:{long_pct:.1f}%"></span>'
+        f'<span class="ratio-short" style="width:{short_pct:.1f}%"></span>'
+        f"</div>"
+        f'<span class="ratio-nums"><b class="long">{open_long}</b> : <b class="short">{open_short}</b></span>'
+        f"</div>"
+    )
+
+
+def _consensus_rows(
+    items: list[ConsensusTarget],
+    window: str = "",
+    *,
+    show_window: bool = False,
+) -> str:
     rows: list[str] = []
     for i, c in enumerate(items, start=1):
+        dir_attr = _consensus_dir_attr(c.consensus_direction)
+        window_attr = f' data-window="{html.escape(window)}"' if window else ""
+        window_col = f"<td>{html.escape(window)}</td>" if show_window else ""
         rows.append(
-            f"<tr data-window=\"{html.escape(window)}\">"
+            f"<tr {dir_attr}{window_attr}>"
             f"<td>{i}</td>"
-            f"<td>{html.escape(window)}</td>"
+            f"{window_col}"
             f"<td><strong>{html.escape(c.coin)}</strong></td>"
-            f"<td data-sort='{c.account_count}' class='wr'>{c.account_count}</td>"
             f"<td>{_dir_badge(c.consensus_direction)}</td>"
-            f"<td data-sort='{c.net_ratio:.6f}'>{c.net_ratio:.0%}</td>"
-            f"<td data-sort='{c.open_long + c.close_short}'>{c.open_long}+{c.close_short}</td>"
-            f"<td data-sort='{c.close_long + c.open_short}'>{c.open_short}+{c.close_long}</td>"
+            f"<td data-sort='{c.net_ratio:.6f}' class='metric-strong'>{c.net_ratio:.0%}</td>"
+            f"<td data-sort='{c.open_long}'>{_ratio_bar_html(c.open_long, c.open_short)}</td>"
+            f"<td data-sort='{c.account_count}' class='metric-strong num'>{c.account_count}</td>"
             f"</tr>"
         )
     return "\n".join(rows)
+
+
+def _consensus_window_block(window: str, items: list[ConsensusTarget]) -> str:
+    body = _consensus_rows(items, window)
+    if not body:
+        body = '<tr><td colspan="6" class="muted">無共識標的</td></tr>'
+    return f"""
+  <div class="consensus-window" data-window="{html.escape(window)}">
+    <h3>{html.escape(window)} 共識 · {len(items)} 個</h3>
+    <div class="table-wrap consensus-table-wrap">
+      <table class="sortable consensus-table">
+        <thead><tr>
+          <th>#</th><th>標的</th><th>方向</th><th>淨比例</th><th>多空分布</th><th class="num">帳號數</th>
+        </tr></thead>
+        <tbody>{body}</tbody>
+      </table>
+    </div>
+  </div>"""
 
 
 def _unified_consensus_section(
@@ -1555,13 +1879,11 @@ def _unified_consensus_section(
     records_4h: list[OpenRecord],
     mids: dict[str, float],
 ) -> str:
-    consensus_body = (
-        _consensus_rows(consensus_72h, "72H")
-        + _consensus_rows(consensus_24h, "24H")
-        + _consensus_rows(consensus_4h, "4H")
+    consensus_blocks = (
+        _consensus_window_block("72H", consensus_72h)
+        + _consensus_window_block("24H", consensus_24h)
+        + _consensus_window_block("4H", consensus_4h)
     )
-    if not consensus_body:
-        consensus_body = "<tr><td colspan='8'>無共識標的</td></tr>"
 
     trade_items: list[tuple[OpenRecord, str]] = []
     for r in records_72h:
@@ -1577,8 +1899,9 @@ def _unified_consensus_section(
         for r, window in trade_items:
             name = html.escape(r.display_name or "—")
             mark = mids.get(r.coin)
+            dir_attr = _consensus_dir_attr(r.direction)
             rows.append(
-                f"<tr data-window=\"{html.escape(window)}\">"
+                f"<tr data-window=\"{html.escape(window)}\" {dir_attr}>"
                 f"<td>{html.escape(window)}</td>"
                 f"<td>{r.rank}</td>"
                 f"<td>{html.escape(r.platform)}</td>"
@@ -1611,16 +1934,8 @@ def _unified_consensus_section(
     </div>
     <div class="subpanels">
       <div id="consensus-targets" class="sub-panel active">
-        <p class="count" style="margin-bottom:8px">共識標的 · {total_consensus} 個（72H {len(consensus_72h)} · 24H {len(consensus_24h)} · 4H {len(consensus_4h)}）</p>
-        <div class="table-wrap">
-          <table class="sortable" id="consensus-table">
-            <thead><tr>
-              <th>#</th><th>時間窗</th><th>標的</th><th>帳號數</th><th>共識方向</th>
-              <th>淨比例</th><th>開多+平空</th><th>開空+平多</th>
-            </tr></thead>
-            <tbody>{consensus_body}</tbody>
-          </table>
-        </div>
+        <p class="count" style="margin-bottom:12px">共識標的 · {total_consensus} 個（72H {len(consensus_72h)} · 24H {len(consensus_24h)} · 4H {len(consensus_4h)}）</p>
+        <div id="consensus-windows">{consensus_blocks}</div>
       </div>
       <div id="consensus-trades" class="sub-panel">
         <p class="count" style="margin-bottom:8px">成交紀錄 · {total_trades} 筆</p>
@@ -1681,6 +1996,57 @@ def _direction_wr_panel_toggle(
   </div>"""
 
 
+def _side_css_class(side: str) -> str:
+    if side == "Long":
+        return "long"
+    if side == "Short":
+        return "short"
+    return ""
+
+
+def _position_tracking_section(changes: list[PositionChange]) -> str:
+    if changes:
+        rows: list[str] = []
+        for c in changes:
+            prev_sz = f"{c.prev_size:.4f}" if c.prev_size else "—"
+            curr_sz = f"{c.curr_size:.4f}" if c.curr_size else "—"
+            pnl_cls = "pos" if c.upnl >= 0 else "neg"
+            rows.append(
+                f"<tr>"
+                f"<td>{_addr_explorer_link(c.address)}</td>"
+                f"<td>{html.escape(c.label or '—')}</td>"
+                f"<td><strong>{html.escape(c.coin)}</strong></td>"
+                f"<td><strong>{html.escape(c.change_type)}</strong></td>"
+                f"<td class='{_side_css_class(c.prev_side)}'>{html.escape(c.prev_side or '—')}</td>"
+                f"<td class='{_side_css_class(c.curr_side)}'>{html.escape(c.curr_side or '—')}</td>"
+                f"<td>{prev_sz}</td>"
+                f"<td>{curr_sz}</td>"
+                f"<td class='num {pnl_cls}'>{_fmt_usd(c.upnl)}</td>"
+                f"<td>{html.escape(c.scanned_at)}</td>"
+                f"</tr>"
+            )
+        tbody = "\n".join(rows)
+    else:
+        tbody = (
+            "<tr><td colspan='10' style='color:var(--muted)'>"
+            "本次無持倉變化（首次掃描僅建立基線，或未偵測到 diff）</td></tr>"
+        )
+    return f"""
+  <div id="positions" class="panel">
+    <p class="count" style="margin-bottom:8px">持倉追蹤 · {len(changes)} 筆變化</p>
+    <div class="table-wrap">
+      <table class="sortable">
+        <thead><tr>
+          <th>地址</th><th>備註</th><th>幣種</th><th>變化</th>
+          <th>原方向</th><th>現方向</th><th>原倉位</th><th>現倉位</th>
+          <th class="num">未實現 PnL</th><th>掃描時間</th>
+        </tr></thead>
+        <tbody>{tbody}</tbody>
+      </table>
+    </div>
+  </div>"""
+
+
 def write_html_report(
     path: str,
     qualified: list[TraderFills],
@@ -1694,6 +2060,7 @@ def write_html_report(
     profiles: dict[str, dict[str, Any]] | None = None,
     fetch_profiles: bool = True,
     include_profiles: bool = True,
+    position_changes: list[PositionChange] | None = None,
 ) -> None:
     records_72h = records_72h or []
     consensus_72h = consensus_72h or []
@@ -1725,13 +2092,13 @@ def write_html_report(
             f"<td>{html.escape(t.platform)}</td>"
             f"<td>{_addr_explorer_link(t.address)}</td>"
             f"<td>{name}</td>"
-            f"<td data-sort='{t.year_roi:.6f}' class='wr'>{_fmt_pct(t.year_roi)}</td>"
-            f"<td data-sort='{t.history_days}'>{t.history_days}</td>"
-            f"<td data-sort='{t.account_value:.2f}'>{_fmt_usd(t.account_value)}</td>"
-            f"<td data-sort='{t.day_pnl:.2f}'>{_fmt_usd(t.day_pnl)}</td>"
-            f"<td data-sort='{t.day_roi:.6f}'>{_fmt_pct(t.day_roi)}</td>"
-            f"<td data-sort='{t.day_volume:.2f}'>{_fmt_usd(t.day_volume)}</td>"
-            f"<td data-sort='{t.week_roi:.6f}'>{_fmt_pct(t.week_roi)}</td>"
+            f"<td data-sort='{t.year_roi:.6f}' class='wr metric-strong num'>{_fmt_pct(t.year_roi)}</td>"
+            f"<td data-sort='{t.history_days}' class='num'>{t.history_days}</td>"
+            f"<td data-sort='{t.account_value:.2f}' class='metric-strong num'>{_fmt_usd(t.account_value)}</td>"
+            f"<td data-sort='{t.day_pnl:.2f}' class='metric-strong num'>{_fmt_usd(t.day_pnl)}</td>"
+            f"<td data-sort='{t.day_roi:.6f}' class='metric-strong num'>{_fmt_pct(t.day_roi)}</td>"
+            f"<td data-sort='{t.day_volume:.2f}' class='metric-strong num'>{_fmt_usd(t.day_volume)}</td>"
+            f"<td data-sort='{t.week_roi:.6f}' class='metric-strong num'>{_fmt_pct(t.week_roi)}</td>"
             f"</tr>"
         )
 
@@ -1739,10 +2106,15 @@ def write_html_report(
         consensus_72h, consensus_24h, consensus_4h,
         records_72h, records_24h, records_4h, mids,
     )
+    position_section = (
+        _position_tracking_section(position_changes)
+        if position_changes is not None else ""
+    )
 
     body = _build_report_html(
         generated, info_hosts, min_year_roi, qualified,
         account_rows, consensus_section, profiles_json,
+        position_section=position_section,
     )
 
     with open(path, "w", encoding="utf-8") as fh:
@@ -1757,7 +2129,12 @@ def _build_report_html(
     account_rows: list[str],
     consensus_section: str,
     profiles_json: str,
+    position_section: str = "",
 ) -> str:
+    positions_tab = (
+        '<button type="button" class="tab" data-panel="positions">持倉追蹤</button>'
+        if position_section else ""
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
@@ -1774,7 +2151,26 @@ def _build_report_html(
   body {{ font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }}
   .wrap {{ max-width: 1400px; margin: 0 auto; padding: 24px 16px 48px; }}
   h1 {{ font-size: 1.5rem; margin-bottom: 4px; }}
-  .sub {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 20px; }}
+  .sub {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 8px; }}
+  .meta-pills {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }}
+  .meta-pill {{ background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; }}
+  .consensus-window {{ margin-bottom: 20px; border: 1px solid var(--border); border-radius: 10px; padding: 16px; background: var(--card); }}
+  .consensus-window h3 {{ font-size: 0.9375rem; margin-bottom: 10px; color: var(--text); font-weight: 600; }}
+  .consensus-table-wrap {{ border: none; background: transparent; }}
+  table.consensus-table {{ font-size: 0.875rem; }}
+  .ratio-wrap {{ display: flex; flex-direction: column; gap: 4px; min-width: 100px; }}
+  .ratio-bar {{ display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--border); }}
+  .ratio-long {{ background: var(--long); }}
+  .ratio-short {{ background: var(--short); }}
+  .ratio-nums {{ font-size: 0.75rem; color: var(--muted); }}
+  .ratio-nums .long {{ color: var(--long); }}
+  .ratio-nums .short {{ color: var(--short); }}
+  tr[data-dir="long"] td:first-child {{ box-shadow: inset 3px 0 0 var(--long); }}
+  tr[data-dir="short"] td:first-child {{ box-shadow: inset 3px 0 0 var(--short); }}
+  .metric-strong {{ font-weight: 700; font-variant-numeric: tabular-nums; }}
+  td.num, th.num {{ text-align: right; }}
+  tbody tr:nth-child(even) td {{ background: rgba(255,255,255,0.02); }}
+  .muted {{ color: var(--muted); }}
   .toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }}
   .tabs, .subtabs {{ display: flex; flex-wrap: wrap; gap: 6px; }}
   .tab, .subtab, .sort-toggle {{
@@ -1860,11 +2256,20 @@ def _build_report_html(
 <body>
 <div class="wrap">
   <h1>Perp 活躍高 ROI 帳號</h1>
-  <p class="sub">產生時間：{html.escape(generated)} · Hyperliquid 免費 API · Info: {html.escape(info_hosts)} · 活躍：30D≥{MIN_FILLS_30D}筆 · 帳齡≥{MIN_HISTORY_DAYS}D · ROI&gt;{min_year_roi:.0%} · 最大回撤&lt;{MAX_PEAK_DRAWDOWN:.0%} · 點擊地址查看詳情</p>
+  <p class="sub">產生時間：{html.escape(generated)} · 點擊地址查看詳情</p>
+  <div class="meta-pills">
+    <span class="meta-pill">Hyperliquid API</span>
+    <span class="meta-pill">Info: {html.escape(info_hosts)}</span>
+    <span class="meta-pill">30D≥{MIN_FILLS_30D}筆</span>
+    <span class="meta-pill">帳齡≥{MIN_HISTORY_DAYS}D</span>
+    <span class="meta-pill">ROI&gt;{min_year_roi:.0%}</span>
+    <span class="meta-pill">最大回撤&lt;{MAX_PEAK_DRAWDOWN:.0%}</span>
+  </div>
 
   <div class="toolbar">
     <div class="tabs main-tabs">
       <button type="button" class="tab active" data-panel="consensus">共識</button>
+      {positions_tab}
       <button type="button" class="tab" data-panel="accounts">帳號排名</button>
     </div>
     <input id="search" type="search" placeholder="搜尋標的、地址...">
@@ -1872,13 +2277,15 @@ def _build_report_html(
 
 {consensus_section}
 
+{position_section}
+
   <div id="accounts" class="panel">
-    <p class="count" style="margin-bottom:8px">共 {len(qualified)} 個帳號 · 點地址前往 Explorer</p>
+    <p class="count" style="margin-bottom:8px">共 {len(qualified)} 個帳號 · 點地址前往 CoinGlass</p>
     <div class="table-wrap">
       <table class="sortable">
         <thead><tr>
-          <th>#</th><th>平台</th><th>地址</th><th>名稱</th><th>ROI</th><th>帳齡(D)</th>
-          <th>帳戶價值</th><th>日PnL</th><th>日ROI</th><th>日成交量</th><th>週ROI</th>
+          <th>#</th><th>平台</th><th>地址</th><th>名稱</th><th class="num">ROI</th><th class="num">帳齡(D)</th>
+          <th class="num">帳戶價值</th><th class="num">日 PnL</th><th class="num">日 ROI</th><th class="num">日成交量</th><th class="num">週 ROI</th>
         </tr></thead>
         <tbody>{"".join(account_rows)}</tbody>
       </table>
@@ -1893,7 +2300,7 @@ def _build_report_html(
       <span style="color:#8b949e">地址：</span>
       <span class="addr-full" id="cg-addr"></span>
       <button type="button" class="cg-icon-btn" id="cg-copy" title="複製">複製</button>
-      <a class="cg-icon-btn" id="cg-explorer" target="_blank" rel="noopener">Explorer</a>
+      <a class="cg-icon-btn" id="cg-explorer" target="_blank" rel="noopener">CoinGlass</a>
       <button type="button" class="cg-icon-btn" id="cg-close" style="margin-left:auto">關閉</button>
     </div>
     <div class="cg-body">
@@ -1954,7 +2361,11 @@ function fmtTime(ms) {{
 function applyWindowFilter(filter) {{
   activeWindowFilter = filter;
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === filter));
-  document.querySelectorAll('#consensus-table tbody tr, #trades-table tbody tr').forEach(row => {{
+  document.querySelectorAll('.consensus-window').forEach(block => {{
+    const w = block.dataset.window || '';
+    block.style.display = (filter === 'all' || w === filter) ? '' : 'none';
+  }});
+  document.querySelectorAll('#trades-table tbody tr').forEach(row => {{
     const w = row.dataset.window || '';
     row.style.display = (filter === 'all' || w === filter) ? '' : 'none';
   }});
@@ -1972,7 +2383,7 @@ function openProfile(addr) {{
   }};
   const modal = document.getElementById('profile-modal');
   document.getElementById('cg-addr').textContent = addr;
-  document.getElementById('cg-explorer').href = 'https://app.hyperliquid.xyz/explorer/address/' + addr;
+  document.getElementById('cg-explorer').href = 'https://www.coinglass.com/hyperliquid/' + addr;
   const pnl = p.pnl || {{}};
   const labels = [['total','總盈虧'],['h24','24小時'],['h48','48小時'],['d7','7天'],['d30','30天']];
   document.getElementById('cg-pnl-stack').innerHTML = labels.map(([k,l]) => {{
@@ -2322,6 +2733,7 @@ def write_summary_txt(
     consensus_4h: list[ConsensusTarget],
     consensus_24h: list[ConsensusTarget],
     min_year_roi: float = MIN_YEAR_ROI,
+    position_changes: list[PositionChange] | None = None,
 ) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("Hyperliquid Top Active High-Win-Rate Accounts\n")
@@ -2345,7 +2757,14 @@ def write_summary_txt(
         )
         fh.write(f"Accounts: {len(qualified)}\n")
         fh.write(f"4H open records: {len(records_4h)}\n")
-        fh.write(f"24H open records: {len(records_24h)}\n\n")
+        fh.write(f"24H open records: {len(records_24h)}\n")
+        if position_changes is not None:
+            addr_count = len({c.address for c in position_changes})
+            fh.write(
+                f"Position changes: {len(position_changes)} "
+                f"({addr_count} watchlist addresses)\n"
+            )
+        fh.write("\n")
 
         fh.write("24H Consensus Targets (by account count):\n")
         fh.write("-" * 80 + "\n")
@@ -2394,6 +2813,16 @@ def main() -> int:
     )
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--html-only", action="store_true", help="Generate HTML from existing CSV in output-dir")
+    parser.add_argument(
+        "--watchlist",
+        default="",
+        help="Watchlist file path (default: {output_dir}/watchlist.txt)",
+    )
+    parser.add_argument(
+        "--track-positions",
+        action="store_true",
+        help="Track position changes for watchlist addresses",
+    )
     args = parser.parse_args()
 
     info_urls, info_auth = build_info_url_config(args.info_urls, args.goldrush_key or None)
@@ -2450,10 +2879,19 @@ def main() -> int:
         write_trades_csv(os.path.join(args.output_dir, "trades_24h.csv"), records_24h)
         write_consensus_csv(os.path.join(args.output_dir, "consensus_4h.csv"), consensus_4h)
         write_consensus_csv(os.path.join(args.output_dir, "consensus_24h.csv"), consensus_24h)
+
+        watchlist_path = args.watchlist or os.path.join(args.output_dir, WATCHLIST_FILE)
+        position_changes: list[PositionChange] | None = None
+        if should_track_positions(args.track_positions, watchlist_path):
+            position_changes = run_position_tracking(
+                args.output_dir, watchlist_path, workers=args.workers,
+            )
+
         write_summary_txt(
             os.path.join(args.output_dir, "summary.txt"),
             qualified, records_4h, records_24h, consensus_4h, consensus_24h,
             min_year_roi=args.min_year_roi,
+            position_changes=position_changes,
         )
         write_hl_routes(os.path.join(args.output_dir, "hl_api_routes.txt"))
         write_html_report(
@@ -2461,6 +2899,7 @@ def main() -> int:
             qualified, records_4h, records_24h, consensus_4h, consensus_24h,
             records_72h=records_72h, consensus_72h=consensus_72h,
             min_year_roi=args.min_year_roi,
+            position_changes=position_changes,
         )
 
         elapsed = time.time() - t0
@@ -2470,6 +2909,9 @@ def main() -> int:
         print(f"  output/consensus_24h.csv  ({len(consensus_24h)} symbols)")
         print(f"  output/report.html")
         print(f"  output/hl_api_routes.txt")
+        if position_changes is not None:
+            print(f"  output/{POSITIONS_SNAPSHOT_CSV}")
+            print(f"  output/{POSITION_CHANGES_CSV}")
         if consensus_24h:
             top = consensus_24h[0]
             print(f"  Top consensus: {top.coin} ({top.account_count} accounts, {format_direction_zh(top.consensus_direction)})")
