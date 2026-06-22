@@ -424,9 +424,12 @@ def watch_consensus(
                 return 0
 
         if gha:
-            send_4h = True
+            send_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
             send_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
-            print(f"  GHA schedule: 4H=always, 24H due={send_24h}")
+            if not send_4h and not send_24h:
+                print("  GHA: no consensus due")
+                return 0
+            print(f"  GHA schedule: 4H due={send_4h}, 24H due={send_24h}")
         else:
             send_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
             send_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")

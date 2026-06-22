@@ -2,8 +2,8 @@ name: Telegram Consensus + HTML Report
 
 on:
   schedule:
-    # Check every 4 hours for 4H / 24H consensus + HTML report
-    - cron: "0 */4 * * *"
+    # Hourly check; telegram_bot gates 4H/24H sends by UTC bucket (GitHub cron is often delayed)
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       force:
