@@ -2814,6 +2814,11 @@ def main() -> int:
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--html-only", action="store_true", help="Generate HTML from existing CSV in output-dir")
     parser.add_argument(
+        "--no-profiles",
+        action="store_true",
+        help="Skip wallet profile fetch in HTML (faster CI)",
+    )
+    parser.add_argument(
         "--watchlist",
         default="",
         help="Watchlist file path (default: {output_dir}/watchlist.txt)",
@@ -2900,6 +2905,8 @@ def main() -> int:
             records_72h=records_72h, consensus_72h=consensus_72h,
             min_year_roi=args.min_year_roi,
             position_changes=position_changes,
+            fetch_profiles=not args.no_profiles,
+            include_profiles=not args.no_profiles,
         )
 
         elapsed = time.time() - t0

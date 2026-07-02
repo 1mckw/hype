@@ -1,0 +1,94 @@
+name: GitHub Pages Report
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pages-report
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Prepare output dir
+        run: mkdir -p output
+
+      - name: Restore data caches
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            output/leaderboard_cache.json
+            output/fills_cache.json
+            output/profiles_cache.json
+          key: hl-data-v2
+          restore-keys: |
+            hl-data-v2
+
+      - name: Build HTML report
+        env:
+          GOLDRUSH_API_KEY: ${{ secrets.GOLDRUSH_API_KEY }}
+        run: |
+          set -euo pipefail
+          python fetch_top_traders.py \
+            --output-dir output \
+            --workers 8 \
+            --scan-limit 1500 \
+            --no-profiles
+
+      - name: Save data caches
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            output/leaderboard_cache.json
+            output/fills_cache.json
+            output/profiles_cache.json
+          key: hl-data-v2-${{ github.run_id }}
+
+      - name: Upload HTML report artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: report-${{ github.run_id }}
+          path: output/report.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # https://1mckw.github.io/hype/
+      # hype repo → Settings → Pages → Source: GitHub Actions
+      - name: Prepare GitHub Pages site
+        run: |
+          mkdir -p pages
+          cp output/report.html pages/index.html
+          touch pages/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
