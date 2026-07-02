@@ -19,6 +19,9 @@ concurrency:
   group: telegram-consensus-alerts
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   push:
     runs-on: ubuntu-latest
@@ -107,8 +110,7 @@ jobs:
           retention-days: 30
 
       # Deploy report to https://1mckw.github.io/hype/
-      # Requires secret HYPE_DEPLOY_TOKEN (PAT with Contents: Read/Write on 1mckw/hype)
-      # Enable Pages on hype: Settings → Pages → Branch gh-pages / (root)
+      # Enable Pages: hype repo → Settings → Pages → Branch gh-pages / (root)
       - name: Prepare GitHub Pages site
         if: hashFiles('output/report.html') != ''
         run: |
@@ -116,13 +118,11 @@ jobs:
           cp output/report.html pages/index.html
           touch pages/.nojekyll
 
-      - name: Deploy to 1mckw/hype
+      - name: Deploy GitHub Pages
         if: hashFiles('output/report.html') != ''
         uses: JamesIves/github-pages-deploy-action@v4
         with:
           folder: pages
-          token: ${{ secrets.HYPE_DEPLOY_TOKEN }}
-          repository-name: 1mckw/hype
           branch: gh-pages
           single-commit: true
           clean: true
