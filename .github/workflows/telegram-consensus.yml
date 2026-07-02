@@ -21,14 +21,21 @@ concurrency:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   push:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
@@ -110,7 +117,7 @@ jobs:
           retention-days: 30
 
       # Deploy report to https://1mckw.github.io/hype/
-      # Enable Pages: hype repo → Settings → Pages → Branch gh-pages / (root)
+      # Enable Pages: hype repo → Settings → Pages → Source: GitHub Actions
       - name: Prepare GitHub Pages site
         if: hashFiles('output/report.html') != ''
         run: |
@@ -118,11 +125,13 @@ jobs:
           cp output/report.html pages/index.html
           touch pages/.nojekyll
 
-      - name: Deploy GitHub Pages
+      - name: Upload Pages artifact
         if: hashFiles('output/report.html') != ''
-        uses: JamesIves/github-pages-deploy-action@v4
+        uses: actions/upload-pages-artifact@v3
         with:
-          folder: pages
-          branch: gh-pages
-          single-commit: true
-          clean: true
+          path: pages
+
+      - name: Deploy to GitHub Pages
+        if: hashFiles('output/report.html') != ''
+        id: deploy
+        uses: actions/deploy-pages@v4

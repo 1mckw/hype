@@ -373,6 +373,25 @@ def send_html_report(
     )
 
 
+def gha_should_run(output_dir: str, *, force: bool) -> bool:
+    if force:
+        return True
+    state = load_state(output_dir)
+    if not state.get("initialized"):
+        return True
+    return (
+        consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
+        or consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
+    )
+
+
+def gha_skip(output_dir: str) -> None:
+    state = load_state(output_dir)
+    state["last_checked_at"] = utc_str(utc_now_ms())
+    save_state(output_dir, state)
+    print("  GHA: no consensus due (skipped)")
+
+
 def watch_consensus(
     token: str,
     chat_id: str,
@@ -592,6 +611,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.token or not args.chat_id:
+        if args.gha and not gha_should_run(args.output_dir, force=args.force):
+            gha_skip(args.output_dir)
+            return 0
         print("ERROR: Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (or --token / --chat-id)", file=sys.stderr)
         return 1
 
