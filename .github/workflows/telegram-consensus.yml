@@ -105,3 +105,24 @@ jobs:
           path: output/telegram_state.json
           if-no-files-found: ignore
           retention-days: 30
+
+      # Deploy report to https://1mckw.github.io/hype/
+      # Requires secret HYPE_DEPLOY_TOKEN (PAT with Contents: Read/Write on 1mckw/hype)
+      # Enable Pages on hype: Settings → Pages → Branch gh-pages / (root)
+      - name: Prepare GitHub Pages site
+        if: hashFiles('output/report.html') != ''
+        run: |
+          mkdir -p pages
+          cp output/report.html pages/index.html
+          touch pages/.nojekyll
+
+      - name: Deploy to 1mckw/hype
+        if: hashFiles('output/report.html') != ''
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: pages
+          token: ${{ secrets.HYPE_DEPLOY_TOKEN }}
+          repository-name: 1mckw/hype
+          branch: gh-pages
+          single-commit: true
+          clean: true
