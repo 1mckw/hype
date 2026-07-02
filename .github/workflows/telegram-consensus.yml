@@ -25,9 +25,9 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -35,7 +35,7 @@ jobs:
         run: mkdir -p output
 
       - name: Restore data caches
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             output/leaderboard_cache.json
@@ -46,7 +46,7 @@ jobs:
             hl-data-v2
 
       - name: Restore telegram state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: output/telegram_state.json
           key: hl-state-v2
@@ -72,7 +72,7 @@ jobs:
       - name: Save data caches
         if: always()
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             output/leaderboard_cache.json
@@ -83,14 +83,14 @@ jobs:
       - name: Save telegram state
         if: always()
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: output/telegram_state.json
           key: hl-state-v2-${{ github.run_id }}
 
       - name: Upload HTML report artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: report-${{ github.run_id }}
           path: output/report.html
@@ -99,7 +99,7 @@ jobs:
 
       - name: Upload telegram state artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: telegram-state-${{ github.run_id }}
           path: output/telegram_state.json
