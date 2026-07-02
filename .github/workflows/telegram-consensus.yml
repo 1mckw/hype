@@ -58,13 +58,15 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GOLDRUSH_API_KEY: ${{ secrets.GOLDRUSH_API_KEY }}
-          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force && 'true' || 'false' }}
-          FORCE_24H: ${{ github.event_name == 'workflow_dispatch' && inputs.force_24h && 'true' || 'false' }}
         run: |
           set -euo pipefail
           ARGS=(--gha --output-dir output --workers 8)
-          if [ "$FORCE" = "true" ]; then ARGS+=(--force); fi
-          if [ "$FORCE_24H" = "true" ]; then ARGS+=(--force-24h); fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            ARGS+=(--force)
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_24h }}" = "true" ]; then
+            ARGS+=(--force-24h)
+          fi
           python telegram_bot.py "${ARGS[@]}"
 
       - name: Save data caches

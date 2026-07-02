@@ -237,13 +237,24 @@ def consensus_bucket(ts_ms: int, bucket_ms: int) -> int:
     return ts_ms // bucket_ms
 
 
+def _bucket_value(state: dict[str, Any], key: str) -> int | None:
+    raw = state.get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def consensus_due(state: dict[str, Any], bucket_ms: int, key: str) -> bool:
     if not state.get("initialized"):
         return False
     now_bucket = consensus_bucket(utc_now_ms(), bucket_ms)
-    if key not in state:
+    last = _bucket_value(state, key)
+    if last is None:
         return True
-    return now_bucket > int(state[key])
+    return now_bucket > last
 
 
 def format_consensus_top5(
@@ -427,7 +438,9 @@ def watch_consensus(
             send_4h = consensus_due(state, BUCKET_4H_MS, "last_consensus_4h_bucket")
             send_24h = consensus_due(state, BUCKET_24H_MS, "last_consensus_24h_bucket")
             if not send_4h and not send_24h:
-                print("  GHA: no consensus due")
+                state["last_checked_at"] = utc_str(now)
+                save_state(output_dir, state)
+                print("  GHA: no consensus due (skipped)")
                 return 0
             print(f"  GHA schedule: 4H due={send_4h}, 24H due={send_24h}")
         else:
@@ -506,7 +519,14 @@ def watch_consensus(
         print(f"  WARN: partial failures: {'; '.join(errors)}", file=sys.stderr)
         html_failed = any(err.startswith("HTML report:") for err in errors)
         if sent == 0 or html_failed:
-            raise RuntimeError("; ".join(errors))
+            if gha:
+                print(
+                    "  GHA: delivery failed but scan completed; "
+                    "will retry on next due bucket",
+                    file=sys.stderr,
+                )
+            else:
+                raise RuntimeError("; ".join(errors))
     return sent
 
 
