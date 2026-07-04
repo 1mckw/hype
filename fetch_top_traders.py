@@ -1795,6 +1795,30 @@ def _fmt_px_range(lo: float, hi: float) -> str:
     return f"{lo:,.4f} – {hi:,.4f}"
 
 
+def _summary_cards_html(
+    account_count: int,
+    consensus_72h: int,
+    consensus_24h: int,
+    consensus_4h: int,
+) -> str:
+    cards = [
+        ("帳號數", str(account_count), ""),
+        ("24H 共識", str(consensus_24h), "accent"),
+        ("72H 共識", str(consensus_72h), ""),
+        ("4H 共識", str(consensus_4h), ""),
+    ]
+    parts: list[str] = []
+    for label, value, accent in cards:
+        cls = " summary-card-accent" if accent else ""
+        parts.append(
+            f'<div class="summary-card{cls}">'
+            f'<div class="label">{html.escape(label)}</div>'
+            f'<div class="value">{html.escape(value)}</div>'
+            f"</div>"
+        )
+    return f'<div class="summary-cards">{"".join(parts)}</div>'
+
+
 def _consensus_dir_attr(direction: str) -> str:
     label = format_direction_zh(direction)
     cls = _direction_badge_cls(label)
@@ -1835,16 +1859,19 @@ def _consensus_rows(
 ) -> str:
     rows: list[str] = []
     for i, c in enumerate(items, start=1):
+        dir_label = format_direction_zh(c.consensus_direction)
         dir_attr = _consensus_dir_attr(c.consensus_direction)
+        side_cls = _direction_badge_cls(dir_label)
+        net_class = f" net-{side_cls}" if side_cls in ("long", "short") else ""
         window_attr = f' data-window="{html.escape(window)}"' if window else ""
         window_col = f"<td>{html.escape(window)}</td>" if show_window else ""
         rows.append(
             f"<tr {dir_attr}{window_attr}>"
             f"<td>{i}</td>"
             f"{window_col}"
-            f"<td><strong>{html.escape(c.coin)}</strong></td>"
+            f'<td class="coin-col"><strong>{html.escape(c.coin)}</strong></td>'
             f"<td>{_dir_badge(c.consensus_direction)}</td>"
-            f"<td data-sort='{c.net_ratio:.6f}' class='metric-strong'>{c.net_ratio:.0%}</td>"
+            f"<td data-sort='{c.net_ratio:.6f}' class='metric-strong num{net_class}'>{c.net_ratio:.0%}</td>"
             f"<td data-sort='{c.open_long}'>{_ratio_bar_html(c.open_long, c.open_short)}</td>"
             f"<td data-sort='{c.account_count}' class='metric-strong num'>{c.account_count}</td>"
             f"</tr>"
@@ -1852,22 +1879,23 @@ def _consensus_rows(
     return "\n".join(rows)
 
 
-def _consensus_window_block(window: str, items: list[ConsensusTarget]) -> str:
+def _consensus_window_block(window: str, items: list[ConsensusTarget], *, open_default: bool = False) -> str:
     body = _consensus_rows(items, window)
     if not body:
         body = '<tr><td colspan="6" class="muted">無共識標的</td></tr>'
+    open_attr = " open" if open_default else ""
     return f"""
-  <div class="consensus-window" data-window="{html.escape(window)}">
-    <h3>{html.escape(window)} 共識 · {len(items)} 個</h3>
+  <details class="consensus-window" data-window="{html.escape(window)}"{open_attr}>
+    <summary><span class="window-title">{html.escape(window)} 共識 · {len(items)} 個</span></summary>
     <div class="table-wrap consensus-table-wrap">
       <table class="sortable consensus-table">
         <thead><tr>
-          <th>#</th><th>標的</th><th>方向</th><th>淨比例</th><th>多空分布</th><th class="num">帳號數</th>
+          <th>#</th><th class="coin-col">標的</th><th>方向</th><th class="num">淨比例</th><th>多空分布</th><th class="num">帳號數</th>
         </tr></thead>
         <tbody>{body}</tbody>
       </table>
     </div>
-  </div>"""
+  </details>"""
 
 
 def _unified_consensus_section(
@@ -1880,9 +1908,9 @@ def _unified_consensus_section(
     mids: dict[str, float],
 ) -> str:
     consensus_blocks = (
-        _consensus_window_block("72H", consensus_72h)
-        + _consensus_window_block("24H", consensus_24h)
+        _consensus_window_block("24H", consensus_24h, open_default=True)
         + _consensus_window_block("4H", consensus_4h)
+        + _consensus_window_block("72H", consensus_72h)
     )
 
     trade_items: list[tuple[OpenRecord, str]] = []
@@ -1903,16 +1931,16 @@ def _unified_consensus_section(
             rows.append(
                 f"<tr data-window=\"{html.escape(window)}\" {dir_attr}>"
                 f"<td>{html.escape(window)}</td>"
-                f"<td>{r.rank}</td>"
+                f"<td class='num'>{r.rank}</td>"
                 f"<td>{html.escape(r.platform)}</td>"
                 f"<td>{_addr_link(r.address, r.platform)}</td>"
                 f"<td>{name}</td>"
-                f"<td><strong>{html.escape(r.coin)}</strong></td>"
+                f'<td class="coin-col"><strong>{html.escape(r.coin)}</strong></td>'
                 f"<td>{_dir_badge(r.direction)}</td>"
-                f"<td data-sort='{r.avg_entry_px:.8f}'>{r.avg_entry_px:,.4f}</td>"
-                f"<td data-sort='{mark or 0}'>{_fmt_px(mark)}</td>"
+                f"<td data-sort='{r.avg_entry_px:.8f}' class='num'>{r.avg_entry_px:,.4f}</td>"
+                f"<td data-sort='{mark or 0}' class='num'>{_fmt_px(mark)}</td>"
                 f"<td data-sort='{r.open_ts}'>{html.escape(r.open_time)}</td>"
-                f"<td>{r.fill_count}</td>"
+                f"<td class='num'>{r.fill_count}</td>"
                 f"</tr>"
             )
         return "\n".join(rows) if rows else "<tr><td colspan='11'>無成交紀錄</td></tr>"
@@ -1927,9 +1955,9 @@ def _unified_consensus_section(
     </div>
     <div class="win-filter">
       <span class="count">時間窗：</span>
-      <button type="button" class="filter-btn active" data-filter="all">全部</button>
+      <button type="button" class="filter-btn" data-filter="all">全部</button>
       <button type="button" class="filter-btn" data-filter="72H">72H</button>
-      <button type="button" class="filter-btn" data-filter="24H">24H</button>
+      <button type="button" class="filter-btn active" data-filter="24H">24H</button>
       <button type="button" class="filter-btn" data-filter="4H">4H</button>
     </div>
     <div class="subpanels">
@@ -1942,8 +1970,8 @@ def _unified_consensus_section(
         <div class="table-wrap">
           <table class="sortable" id="trades-table">
             <thead><tr>
-              <th>時間窗</th><th>排名</th><th>平台</th><th>地址</th><th>名稱</th><th>標的</th>
-              <th>方向</th><th>平均成交價</th><th>現價</th><th>成交時間 (UTC)</th><th>成交筆數</th>
+              <th>時間窗</th><th class="num">排名</th><th>平台</th><th>地址</th><th>名稱</th><th class="coin-col">標的</th>
+              <th>方向</th><th class="num">平均成交價</th><th class="num">現價</th><th>成交時間 (UTC)</th><th class="num">成交筆數</th>
             </tr></thead>
             <tbody>{unified_trade_rows()}</tbody>
           </table>
@@ -2115,6 +2143,9 @@ def write_html_report(
         generated, info_hosts, min_year_roi, qualified,
         account_rows, consensus_section, profiles_json,
         position_section=position_section,
+        consensus_72h=len(consensus_72h),
+        consensus_24h=len(consensus_24h),
+        consensus_4h=len(consensus_4h),
     )
 
     with open(path, "w", encoding="utf-8") as fh:
@@ -2130,10 +2161,17 @@ def _build_report_html(
     consensus_section: str,
     profiles_json: str,
     position_section: str = "",
+    *,
+    consensus_72h: int = 0,
+    consensus_24h: int = 0,
+    consensus_4h: int = 0,
 ) -> str:
     positions_tab = (
         '<button type="button" class="tab" data-panel="positions">持倉追蹤</button>'
         if position_section else ""
+    )
+    summary_cards = _summary_cards_html(
+        len(qualified), consensus_72h, consensus_24h, consensus_4h,
     )
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -2148,16 +2186,32 @@ def _build_report_html(
     --accent: #00d4aa; --long: #22c55e; --short: #ef4444;
   }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }}
+  body {{ font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; font-size: 0.9rem; }}
   .wrap {{ max-width: 1400px; margin: 0 auto; padding: 24px 16px 48px; }}
-  h1 {{ font-size: 1.5rem; margin-bottom: 4px; }}
-  .sub {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 8px; }}
+  h1 {{ font-size: 1.625rem; margin-bottom: 6px; letter-spacing: -0.02em; }}
+  .sub {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 12px; }}
+  .summary-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }}
+  .summary-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }}
+  .summary-card-accent {{ border-color: rgba(0,212,170,0.45); background: rgba(0,212,170,0.06); }}
+  .summary-card .label {{ color: var(--muted); font-size: 0.75rem; margin-bottom: 4px; }}
+  .summary-card .value {{ font-size: 1.4rem; font-weight: 700; font-variant-numeric: tabular-nums; }}
+  .summary-card-accent .value {{ color: var(--accent); }}
   .meta-pills {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }}
   .meta-pill {{ background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; }}
-  .consensus-window {{ margin-bottom: 20px; border: 1px solid var(--border); border-radius: 10px; padding: 16px; background: var(--card); }}
-  .consensus-window h3 {{ font-size: 0.9375rem; margin-bottom: 10px; color: var(--text); font-weight: 600; }}
+  .consensus-window {{ margin-bottom: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 0; background: var(--card); overflow: hidden; }}
+  .consensus-window summary {{ list-style: none; cursor: pointer; padding: 14px 16px; font-weight: 600; font-size: 0.9375rem; }}
+  .consensus-window summary::-webkit-details-marker {{ display: none; }}
+  .consensus-window summary::before {{ content: "▸ "; color: var(--accent); }}
+  .consensus-window[open] summary::before {{ content: "▾ "; }}
+  .consensus-window summary:hover {{ background: rgba(255,255,255,0.03); }}
+  .consensus-window .consensus-table-wrap {{ padding: 0 12px 12px; }}
   .consensus-table-wrap {{ border: none; background: transparent; }}
-  table.consensus-table {{ font-size: 0.875rem; }}
+  table.consensus-table {{ font-size: 0.9rem; }}
+  .coin-col {{ position: sticky; left: 0; z-index: 1; background: var(--card); box-shadow: 1px 0 0 var(--border); }}
+  tr:hover .coin-col {{ background: rgba(0,212,170,0.08); }}
+  th.coin-col {{ z-index: 2; background: #0f151c; }}
+  .net-long {{ color: var(--long); }}
+  .net-short {{ color: var(--short); }}
   .ratio-wrap {{ display: flex; flex-direction: column; gap: 4px; min-width: 100px; }}
   .ratio-bar {{ display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--border); }}
   .ratio-long {{ background: var(--long); }}
@@ -2195,7 +2249,7 @@ def _build_report_html(
   .panel.active {{ display: block; }}
   .table-wrap {{ overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }}
   table {{ width: 100%; border-collapse: collapse; font-size: 0.8125rem; }}
-  th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }}
+  th, td {{ padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }}
   th {{ background: #0f151c; color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; }}
   th:hover {{ color: var(--accent); }}
   tr:hover td {{ background: rgba(0,212,170,0.05); }}
@@ -2265,6 +2319,8 @@ def _build_report_html(
     <span class="meta-pill">ROI&gt;{min_year_roi:.0%}</span>
     <span class="meta-pill">最大回撤&lt;{MAX_PEAK_DRAWDOWN:.0%}</span>
   </div>
+
+  {summary_cards}
 
   <div class="toolbar">
     <div class="tabs main-tabs">
@@ -2520,7 +2576,7 @@ document.querySelectorAll('table.sortable').forEach(table => {{
   }});
 }});
 
-applyWindowFilter('all');
+applyWindowFilter('24H');
 </script>
 </body>
 </html>"""
