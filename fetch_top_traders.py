@@ -1795,30 +1795,6 @@ def _fmt_px_range(lo: float, hi: float) -> str:
     return f"{lo:,.4f} – {hi:,.4f}"
 
 
-def _summary_cards_html(
-    account_count: int,
-    consensus_72h: int,
-    consensus_24h: int,
-    consensus_4h: int,
-) -> str:
-    cards = [
-        ("帳號數", str(account_count), ""),
-        ("24H 共識", str(consensus_24h), "accent"),
-        ("72H 共識", str(consensus_72h), ""),
-        ("4H 共識", str(consensus_4h), ""),
-    ]
-    parts: list[str] = []
-    for label, value, accent in cards:
-        cls = " summary-card-accent" if accent else ""
-        parts.append(
-            f'<div class="summary-card{cls}">'
-            f'<div class="label">{html.escape(label)}</div>'
-            f'<div class="value">{html.escape(value)}</div>'
-            f"</div>"
-        )
-    return f'<div class="summary-cards">{"".join(parts)}</div>'
-
-
 def _consensus_dir_attr(direction: str) -> str:
     label = format_direction_zh(direction)
     cls = _direction_badge_cls(label)
@@ -1846,56 +1822,77 @@ def _ratio_bar_html(open_long: int, open_short: int) -> str:
         f'<span class="ratio-long" style="width:{long_pct:.1f}%"></span>'
         f'<span class="ratio-short" style="width:{short_pct:.1f}%"></span>'
         f"</div>"
-        f'<span class="ratio-nums"><b class="long">{open_long}</b> : <b class="short">{open_short}</b></span>'
+        f'<span class="ratio-nums"><b class="long">{open_long}</b> 開多 · <b class="short">{open_short}</b> 開空</span>'
         f"</div>"
     )
 
 
-def _consensus_rows(
-    items: list[ConsensusTarget],
-    window: str = "",
-    *,
-    show_window: bool = False,
-) -> str:
-    rows: list[str] = []
-    for i, c in enumerate(items, start=1):
-        dir_label = format_direction_zh(c.consensus_direction)
-        dir_attr = _consensus_dir_attr(c.consensus_direction)
-        side_cls = _direction_badge_cls(dir_label)
-        net_class = f" net-{side_cls}" if side_cls in ("long", "short") else ""
-        window_attr = f' data-window="{html.escape(window)}"' if window else ""
-        window_col = f"<td>{html.escape(window)}</td>" if show_window else ""
-        rows.append(
-            f"<tr {dir_attr}{window_attr}>"
-            f"<td>{i}</td>"
-            f"{window_col}"
-            f'<td class="coin-col"><strong>{html.escape(c.coin)}</strong></td>'
-            f"<td>{_dir_badge(c.consensus_direction)}</td>"
-            f"<td data-sort='{c.net_ratio:.6f}' class='metric-strong num{net_class}'>{c.net_ratio:.0%}</td>"
-            f"<td data-sort='{c.open_long}'>{_ratio_bar_html(c.open_long, c.open_short)}</td>"
-            f"<td data-sort='{c.account_count}' class='metric-strong num'>{c.account_count}</td>"
-            f"</tr>"
+def _consensus_card_html(c: ConsensusTarget, rank: int, *, featured: bool = False) -> str:
+    dir_label = format_direction_zh(c.consensus_direction)
+    side_cls = _direction_badge_cls(dir_label)
+    if side_cls == "neutral":
+        side = direction_side(c.consensus_direction)
+        side_cls = "long" if side == "Long" else "short" if side == "Short" else "neutral"
+    feat = " featured" if featured else ""
+    dir_word = "做多" if side_cls == "long" else "做空" if side_cls == "short" else dir_label
+    return (
+        f'<article class="coin-card{feat}" data-dir="{side_cls}">'
+        f'<div class="coin-card-top">'
+        f'<span class="coin-rank">#{rank}</span>'
+        f'<span class="coin-name">{html.escape(c.coin)}</span>'
+        f'<span class="dir-pill {side_cls}">{html.escape(dir_word)}</span>'
+        f"</div>"
+        f'<div class="coin-card-metric">'
+        f'<span class="metric-label">共識強度</span>'
+        f'<span class="metric-value net-{side_cls}">{c.net_ratio:.0%}</span>'
+        f"</div>"
+        f"{_ratio_bar_html(c.open_long, c.open_short)}"
+        f'<div class="coin-card-foot">{c.account_count} 個帳號同向</div>'
+        f"</article>"
+    )
+
+
+def _consensus_window_board(window: str, items: list[ConsensusTarget], *, active: bool = False) -> str:
+    active_cls = " active" if active else ""
+    if not items:
+        body = '<p class="empty-hint">此時間窗暫無共識標的</p>'
+    else:
+        featured = items[:6]
+        rest = items[6:]
+        cards = "".join(
+            _consensus_card_html(c, i, featured=True)
+            for i, c in enumerate(featured, start=1)
         )
-    return "\n".join(rows)
-
-
-def _consensus_window_block(window: str, items: list[ConsensusTarget], *, open_default: bool = False) -> str:
-    body = _consensus_rows(items, window)
-    if not body:
-        body = '<tr><td colspan="6" class="muted">無共識標的</td></tr>'
-    open_attr = " open" if open_default else ""
-    return f"""
-  <details class="consensus-window" data-window="{html.escape(window)}"{open_attr}>
-    <summary><span class="window-title">{html.escape(window)} 共識 · {len(items)} 個</span></summary>
-    <div class="table-wrap consensus-table-wrap">
-      <table class="sortable consensus-table">
-        <thead><tr>
-          <th>#</th><th class="coin-col">標的</th><th>方向</th><th class="num">淨比例</th><th>多空分布</th><th class="num">帳號數</th>
-        </tr></thead>
-        <tbody>{body}</tbody>
-      </table>
-    </div>
-  </details>"""
+        body = f'<div class="coin-grid">{cards}</div>'
+        if rest:
+            rows: list[str] = []
+            for i, c in enumerate(rest, start=7):
+                dir_label = format_direction_zh(c.consensus_direction)
+                side_cls = _direction_badge_cls(dir_label)
+                if side_cls == "neutral":
+                    side = direction_side(c.consensus_direction)
+                    side_cls = "long" if side == "Long" else "short" if side == "Short" else "neutral"
+                dir_word = "多" if side_cls == "long" else "空" if side_cls == "short" else dir_label
+                rows.append(
+                    f'<div class="coin-row" data-dir="{side_cls}">'
+                    f'<span class="coin-rank">#{i}</span>'
+                    f'<span class="coin-name">{html.escape(c.coin)}</span>'
+                    f'<span class="dir-pill {side_cls}">{html.escape(dir_word)}</span>'
+                    f'<span class="metric-value net-{side_cls}">{c.net_ratio:.0%}</span>'
+                    f'<span class="row-accounts">{c.account_count}帳</span>'
+                    f'<span class="row-ratio">{_ratio_bar_html(c.open_long, c.open_short)}</span>'
+                    f"</div>"
+                )
+            body += (
+                f'<div class="coin-list">'
+                f'<p class="section-label">其餘標的 · {len(rest)}</p>'
+                f'{"".join(rows)}</div>'
+            )
+    return (
+        f'<div class="window-board{active_cls}" data-window="{html.escape(window)}">'
+        f'<p class="board-caption">{html.escape(window)} · {len(items)} 個共識</p>'
+        f"{body}</div>"
+    )
 
 
 def _unified_consensus_section(
@@ -1907,10 +1904,10 @@ def _unified_consensus_section(
     records_4h: list[OpenRecord],
     mids: dict[str, float],
 ) -> str:
-    consensus_blocks = (
-        _consensus_window_block("24H", consensus_24h, open_default=True)
-        + _consensus_window_block("4H", consensus_4h)
-        + _consensus_window_block("72H", consensus_72h)
+    boards = (
+        _consensus_window_board("24H", consensus_24h, active=True)
+        + _consensus_window_board("4H", consensus_4h)
+        + _consensus_window_board("72H", consensus_72h)
     )
 
     trade_items: list[tuple[OpenRecord, str]] = []
@@ -1929,10 +1926,9 @@ def _unified_consensus_section(
             mark = mids.get(r.coin)
             dir_attr = _consensus_dir_attr(r.direction)
             rows.append(
-                f"<tr data-window=\"{html.escape(window)}\" {dir_attr}>"
+                f'<tr data-window="{html.escape(window)}" {dir_attr}>'
                 f"<td>{html.escape(window)}</td>"
                 f"<td class='num'>{r.rank}</td>"
-                f"<td>{html.escape(r.platform)}</td>"
                 f"<td>{_addr_link(r.address, r.platform)}</td>"
                 f"<td>{name}</td>"
                 f'<td class="coin-col"><strong>{html.escape(r.coin)}</strong></td>'
@@ -1940,38 +1936,35 @@ def _unified_consensus_section(
                 f"<td data-sort='{r.avg_entry_px:.8f}' class='num'>{r.avg_entry_px:,.4f}</td>"
                 f"<td data-sort='{mark or 0}' class='num'>{_fmt_px(mark)}</td>"
                 f"<td data-sort='{r.open_ts}'>{html.escape(r.open_time)}</td>"
-                f"<td class='num'>{r.fill_count}</td>"
                 f"</tr>"
             )
-        return "\n".join(rows) if rows else "<tr><td colspan='11'>無成交紀錄</td></tr>"
+        return "\n".join(rows) if rows else "<tr><td colspan='9'>無成交紀錄</td></tr>"
 
-    total_consensus = len(consensus_72h) + len(consensus_24h) + len(consensus_4h)
     total_trades = len(records_72h) + len(records_24h) + len(records_4h)
     return f"""
   <div id="consensus" class="panel active">
-    <div class="subtabs">
-      <button type="button" class="subtab active" data-subpanel="consensus-targets">共識標的</button>
-      <button type="button" class="subtab" data-subpanel="consensus-trades">成交紀錄</button>
-    </div>
-    <div class="win-filter">
-      <span class="count">時間窗：</span>
-      <button type="button" class="filter-btn" data-filter="all">全部</button>
-      <button type="button" class="filter-btn" data-filter="72H">72H</button>
-      <button type="button" class="filter-btn active" data-filter="24H">24H</button>
-      <button type="button" class="filter-btn" data-filter="4H">4H</button>
+    <div class="view-bar">
+      <div class="win-seg" role="tablist" aria-label="時間窗">
+        <button type="button" class="seg-btn active" data-filter="24H">24 小時</button>
+        <button type="button" class="seg-btn" data-filter="4H">4 小時</button>
+        <button type="button" class="seg-btn" data-filter="72H">72 小時</button>
+      </div>
+      <div class="subtabs">
+        <button type="button" class="subtab active" data-subpanel="consensus-targets">共識看板</button>
+        <button type="button" class="subtab" data-subpanel="consensus-trades">成交明細</button>
+      </div>
     </div>
     <div class="subpanels">
       <div id="consensus-targets" class="sub-panel active">
-        <p class="count" style="margin-bottom:12px">共識標的 · {total_consensus} 個（72H {len(consensus_72h)} · 24H {len(consensus_24h)} · 4H {len(consensus_4h)}）</p>
-        <div id="consensus-windows">{consensus_blocks}</div>
+        <div id="consensus-windows">{boards}</div>
       </div>
       <div id="consensus-trades" class="sub-panel">
-        <p class="count" style="margin-bottom:8px">成交紀錄 · {total_trades} 筆</p>
+        <p class="section-label">成交明細 · {total_trades} 筆</p>
         <div class="table-wrap">
           <table class="sortable" id="trades-table">
             <thead><tr>
-              <th>時間窗</th><th class="num">排名</th><th>平台</th><th>地址</th><th>名稱</th><th class="coin-col">標的</th>
-              <th>方向</th><th class="num">平均成交價</th><th class="num">現價</th><th>成交時間 (UTC)</th><th class="num">成交筆數</th>
+              <th>時間窗</th><th class="num">排名</th><th>地址</th><th>名稱</th><th class="coin-col">標的</th>
+              <th>方向</th><th class="num">成交價</th><th class="num">現價</th><th>時間 (UTC)</th>
             </tr></thead>
             <tbody>{unified_trade_rows()}</tbody>
           </table>
@@ -2143,9 +2136,9 @@ def write_html_report(
         generated, info_hosts, min_year_roi, qualified,
         account_rows, consensus_section, profiles_json,
         position_section=position_section,
-        consensus_72h=len(consensus_72h),
         consensus_24h=len(consensus_24h),
         consensus_4h=len(consensus_4h),
+        consensus_72h=len(consensus_72h),
     )
 
     with open(path, "w", encoding="utf-8") as fh:
@@ -2170,105 +2163,189 @@ def _build_report_html(
         '<button type="button" class="tab" data-panel="positions">持倉追蹤</button>'
         if position_section else ""
     )
-    summary_cards = _summary_cards_html(
-        len(qualified), consensus_72h, consensus_24h, consensus_4h,
-    )
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Perp 高 ROI 帳號報告</title>
+<title>HYPE · 高 ROI 共識</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 <style>
   :root {{
-    --bg: #0b0f14; --card: #131a22; --border: #1e2a38;
-    --text: #e8edf2; --muted: #8b9cb3;
-    --accent: #00d4aa; --long: #22c55e; --short: #ef4444;
+    --bg: #0a0e12;
+    --bg-elev: #12181f;
+    --card: #161d26;
+    --border: #273140;
+    --text: #eef2f6;
+    --muted: #8a9aab;
+    --accent: #2dd4a8;
+    --accent-dim: rgba(45,212,168,0.12);
+    --long: #3dd68c;
+    --short: #f07178;
+    --long-bg: rgba(61,214,140,0.12);
+    --short-bg: rgba(240,113,120,0.12);
   }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; font-size: 0.9rem; }}
-  .wrap {{ max-width: 1400px; margin: 0 auto; padding: 24px 16px 48px; }}
-  h1 {{ font-size: 1.625rem; margin-bottom: 6px; letter-spacing: -0.02em; }}
-  .sub {{ color: var(--muted); font-size: 0.875rem; margin-bottom: 12px; }}
-  .summary-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }}
-  .summary-card {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }}
-  .summary-card-accent {{ border-color: rgba(0,212,170,0.45); background: rgba(0,212,170,0.06); }}
-  .summary-card .label {{ color: var(--muted); font-size: 0.75rem; margin-bottom: 4px; }}
-  .summary-card .value {{ font-size: 1.4rem; font-weight: 700; font-variant-numeric: tabular-nums; }}
-  .summary-card-accent .value {{ color: var(--accent); }}
-  .meta-pills {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }}
-  .meta-pill {{ background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; }}
-  .consensus-window {{ margin-bottom: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 0; background: var(--card); overflow: hidden; }}
-  .consensus-window summary {{ list-style: none; cursor: pointer; padding: 14px 16px; font-weight: 600; font-size: 0.9375rem; }}
-  .consensus-window summary::-webkit-details-marker {{ display: none; }}
-  .consensus-window summary::before {{ content: "▸ "; color: var(--accent); }}
-  .consensus-window[open] summary::before {{ content: "▾ "; }}
-  .consensus-window summary:hover {{ background: rgba(255,255,255,0.03); }}
-  .consensus-window .consensus-table-wrap {{ padding: 0 12px 12px; }}
-  .consensus-table-wrap {{ border: none; background: transparent; }}
-  table.consensus-table {{ font-size: 0.9rem; }}
-  .coin-col {{ position: sticky; left: 0; z-index: 1; background: var(--card); box-shadow: 1px 0 0 var(--border); }}
-  tr:hover .coin-col {{ background: rgba(0,212,170,0.08); }}
-  th.coin-col {{ z-index: 2; background: #0f151c; }}
+  body {{
+    font-family: "DM Sans", system-ui, sans-serif;
+    background:
+      radial-gradient(1200px 500px at 10% -10%, rgba(45,212,168,0.08), transparent 55%),
+      radial-gradient(900px 400px at 90% 0%, rgba(61,214,140,0.05), transparent 50%),
+      var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    font-size: 15px;
+  }}
+  .wrap {{ max-width: 1180px; margin: 0 auto; padding: 28px 18px 64px; }}
+  .hero {{ margin-bottom: 22px; }}
+  .brand {{
+    font-size: 0.8rem; font-weight: 700; letter-spacing: 0.14em;
+    color: var(--accent); text-transform: uppercase; margin-bottom: 8px;
+  }}
+  h1 {{ font-size: clamp(1.6rem, 3vw, 2rem); font-weight: 700; letter-spacing: -0.03em; margin-bottom: 8px; }}
+  .sub {{ color: var(--muted); font-size: 0.92rem; }}
+  .hero-stats {{
+    display: flex; flex-wrap: wrap; gap: 18px 28px; margin-top: 16px;
+    padding: 14px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  }}
+  .hero-stat .k {{ display: block; color: var(--muted); font-size: 0.75rem; margin-bottom: 2px; }}
+  .hero-stat .v {{ font-family: "JetBrains Mono", ui-monospace, monospace; font-weight: 700; font-size: 1.15rem; }}
+  .hero-stat .v.accent {{ color: var(--accent); }}
+  details.filters {{ margin: 14px 0 20px; }}
+  details.filters summary {{
+    cursor: pointer; color: var(--muted); font-size: 0.82rem; list-style: none;
+  }}
+  details.filters summary::-webkit-details-marker {{ display: none; }}
+  details.filters summary::before {{ content: "▸ "; color: var(--accent); }}
+  details.filters[open] summary::before {{ content: "▾ "; }}
+  .meta-pills {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }}
+  .meta-pill {{
+    background: var(--bg-elev); border: 1px solid var(--border); color: var(--muted);
+    padding: 4px 10px; border-radius: 999px; font-size: 0.72rem;
+  }}
+  .toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }}
+  .tabs {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+  .tab, .subtab {{
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+    padding: 9px 16px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 0.88rem;
+    min-height: 40px; transition: border-color .15s, background .15s, color .15s;
+  }}
+  .tab:hover, .subtab:hover {{ border-color: var(--accent); color: var(--text); }}
+  .tab.active, .subtab.active {{ background: var(--accent); color: #04120e; border-color: var(--accent); font-weight: 700; }}
+  #search {{
+    flex: 1; min-width: 180px; background: var(--card); border: 1px solid var(--border);
+    color: var(--text); padding: 10px 14px; border-radius: 999px; font: inherit; font-size: 0.88rem;
+  }}
+  #search:focus {{ outline: 2px solid rgba(45,212,168,0.35); border-color: var(--accent); }}
+  .view-bar {{
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+    margin-bottom: 18px;
+  }}
+  .win-seg {{
+    display: inline-flex; background: var(--bg-elev); border: 1px solid var(--border);
+    border-radius: 999px; padding: 4px; gap: 2px;
+  }}
+  .seg-btn {{
+    background: transparent; border: none; color: var(--muted); padding: 8px 16px;
+    border-radius: 999px; cursor: pointer; font: inherit; font-size: 0.88rem; font-weight: 600;
+    min-height: 36px; transition: background .15s, color .15s;
+  }}
+  .seg-btn:hover {{ color: var(--text); }}
+  .seg-btn.active {{ background: var(--card); color: var(--accent); box-shadow: 0 0 0 1px var(--border); }}
+  .subtabs {{ display: flex; gap: 6px; }}
+  .panel {{ display: none; }}
+  .panel.active {{ display: block; }}
+  .sub-panel {{ display: none; }}
+  .sub-panel.active {{ display: block; }}
+  .window-board {{ display: none; animation: fadeUp .28s ease; }}
+  .window-board.active {{ display: block; }}
+  @keyframes fadeUp {{
+    from {{ opacity: 0; transform: translateY(6px); }}
+    to {{ opacity: 1; transform: none; }}
+  }}
+  @media (prefers-reduced-motion: reduce) {{
+    .window-board {{ animation: none; }}
+    .tab, .subtab, .seg-btn {{ transition: none; }}
+  }}
+  .board-caption {{ color: var(--muted); font-size: 0.85rem; margin-bottom: 12px; }}
+  .section-label {{ color: var(--muted); font-size: 0.82rem; margin: 20px 0 10px; }}
+  .empty-hint {{ color: var(--muted); padding: 28px 8px; text-align: center; }}
+  .coin-grid {{
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px;
+  }}
+  .coin-card {{
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px; display: flex; flex-direction: column; gap: 12px;
+    transition: border-color .15s, transform .15s;
+  }}
+  .coin-card.featured {{ min-height: 168px; }}
+  .coin-card[data-dir="long"] {{ border-left: 3px solid var(--long); }}
+  .coin-card[data-dir="short"] {{ border-left: 3px solid var(--short); }}
+  .coin-card:hover {{ border-color: rgba(45,212,168,0.45); transform: translateY(-1px); }}
+  .coin-card-top {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+  .coin-rank {{ color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 0.78rem; }}
+  .coin-name {{ font-size: 1.2rem; font-weight: 700; letter-spacing: -0.02em; flex: 1; }}
+  .dir-pill {{
+    display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 999px;
+    font-size: 0.75rem; font-weight: 700;
+  }}
+  .dir-pill.long {{ background: var(--long-bg); color: var(--long); }}
+  .dir-pill.short {{ background: var(--short-bg); color: var(--short); }}
+  .dir-pill.neutral {{ background: rgba(138,154,171,0.15); color: var(--muted); }}
+  .coin-card-metric {{ display: flex; justify-content: space-between; align-items: baseline; }}
+  .metric-label {{ color: var(--muted); font-size: 0.75rem; }}
+  .metric-value {{
+    font-family: "JetBrains Mono", monospace; font-weight: 700; font-size: 1.35rem;
+  }}
   .net-long {{ color: var(--long); }}
   .net-short {{ color: var(--short); }}
-  .ratio-wrap {{ display: flex; flex-direction: column; gap: 4px; min-width: 100px; }}
-  .ratio-bar {{ display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--border); }}
+  .coin-card-foot {{ color: var(--muted); font-size: 0.8rem; }}
+  .ratio-wrap {{ display: flex; flex-direction: column; gap: 5px; }}
+  .ratio-bar {{ display: flex; height: 7px; border-radius: 999px; overflow: hidden; background: var(--border); }}
   .ratio-long {{ background: var(--long); }}
   .ratio-short {{ background: var(--short); }}
   .ratio-nums {{ font-size: 0.75rem; color: var(--muted); }}
   .ratio-nums .long {{ color: var(--long); }}
   .ratio-nums .short {{ color: var(--short); }}
-  tr[data-dir="long"] td:first-child {{ box-shadow: inset 3px 0 0 var(--long); }}
-  tr[data-dir="short"] td:first-child {{ box-shadow: inset 3px 0 0 var(--short); }}
-  .metric-strong {{ font-weight: 700; font-variant-numeric: tabular-nums; }}
-  td.num, th.num {{ text-align: right; }}
-  tbody tr:nth-child(even) td {{ background: rgba(255,255,255,0.02); }}
-  .muted {{ color: var(--muted); }}
-  .toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }}
-  .tabs, .subtabs {{ display: flex; flex-wrap: wrap; gap: 6px; }}
-  .tab, .subtab, .sort-toggle {{
-    background: var(--card); border: 1px solid var(--border); color: var(--muted);
-    padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 0.875rem;
+  .coin-list {{ display: flex; flex-direction: column; gap: 6px; }}
+  .coin-row {{
+    display: grid; grid-template-columns: 40px minmax(72px, 1fr) auto auto auto minmax(120px, 1.4fr);
+    gap: 10px; align-items: center; padding: 10px 12px; background: var(--card);
+    border: 1px solid var(--border); border-radius: 10px;
   }}
-  .tab.active, .subtab.active {{ background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }}
-  .sort-toggle {{ padding: 6px 14px; font-size: 0.8125rem; margin-left: auto; }}
-  .sort-toggle.active-desc {{ border-color: var(--long); color: var(--long); }}
-  .sort-toggle.active-asc {{ border-color: var(--short); color: var(--short); }}
-  #search {{ flex: 1; min-width: 200px; background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 8px; font-size: 0.875rem; }}
-  .win-panel {{ display: none; }}
-  .win-panel.active {{ display: block; }}
-  .sub-panel {{ display: none; }}
-  .sub-panel.active {{ display: block; }}
-  .panel-head {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 8px; }}
-  .panel-head .count {{ margin: 0; flex: 1; }}
-  .subtabs {{ margin-bottom: 12px; }}
-  tbody.wr-body {{ display: none; }}
-  tbody.wr-body.active {{ display: table-row-group; }}
-  .panel {{ display: none; }}
-  .panel.active {{ display: block; }}
-  .table-wrap {{ overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 0.8125rem; }}
-  th, td {{ padding: 11px 14px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }}
-  th {{ background: #0f151c; color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; }}
+  .coin-row[data-dir="long"] {{ box-shadow: inset 3px 0 0 var(--long); }}
+  .coin-row[data-dir="short"] {{ box-shadow: inset 3px 0 0 var(--short); }}
+  .coin-row .coin-name {{ font-size: 1rem; }}
+  .coin-row .metric-value {{ font-size: 1rem; }}
+  .row-accounts {{ color: var(--muted); font-size: 0.8rem; white-space: nowrap; }}
+  .row-ratio .ratio-nums {{ display: none; }}
+  @media (max-width: 720px) {{
+    .coin-row {{ grid-template-columns: 36px 1fr auto auto; }}
+    .row-ratio {{ display: none; }}
+  }}
+  .table-wrap {{ overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+  th, td {{ padding: 11px 13px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }}
+  th {{ background: var(--bg-elev); color: var(--muted); font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; }}
   th:hover {{ color: var(--accent); }}
-  tr:hover td {{ background: rgba(0,212,170,0.05); }}
+  tr:hover td {{ background: var(--accent-dim); }}
+  td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  .metric-strong {{ font-weight: 700; font-family: "JetBrains Mono", monospace; }}
+  .wr {{ color: var(--accent); font-weight: 700; }}
+  .coin-col {{ position: sticky; left: 0; z-index: 1; background: var(--card); }}
+  th.coin-col {{ z-index: 2; background: var(--bg-elev); }}
   a {{ color: var(--accent); text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
-  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }}
-  .badge.long {{ background: rgba(34,197,94,0.15); color: var(--long); }}
-  .badge.short {{ background: rgba(239,68,68,0.15); color: var(--short); }}
-  .badge.neutral {{ background: rgba(139,156,179,0.15); color: var(--muted); }}
-  .wr {{ color: var(--accent); font-weight: 600; }}
-  .count {{ color: var(--muted); font-size: 0.8125rem; }}
-  .addr-btn {{ background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; }}
-  .addr-btn:hover {{ text-decoration: underline; }}
-  .filter-btn {{
-    background: var(--card); border: 1px solid var(--border); color: var(--muted);
-    padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 0.8125rem;
-  }}
-  .filter-btn.active {{ border-color: var(--accent); color: var(--accent); }}
-  .win-filter {{ display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }}
+  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; }}
+  .badge.long {{ background: var(--long-bg); color: var(--long); }}
+  .badge.short {{ background: var(--short-bg); color: var(--short); }}
+  .badge.neutral {{ background: rgba(138,154,171,0.15); color: var(--muted); }}
+  .count {{ color: var(--muted); font-size: 0.82rem; }}
+  .muted {{ color: var(--muted); }}
+  .pos {{ color: var(--long); }}
+  .neg {{ color: var(--short); }}
   .cg-tab-panel {{ display: none; }}
   .cg-tab-panel.active {{ display: block; }}
   .cg-modal {{ position: fixed; inset: 0; z-index: 9999; display: flex; align-items: flex-start; justify-content: center; padding: 24px 12px; overflow-y: auto; }}
@@ -2276,7 +2353,7 @@ def _build_report_html(
   .cg-backdrop {{ position: fixed; inset: 0; background: rgba(0,0,0,0.72); }}
   .cg-panel {{ position: relative; width: min(1200px, 100%); background: #0d1117; border: 1px solid #21262d; border-radius: 12px; margin-top: 20px; }}
   .cg-header {{ display: flex; align-items: center; gap: 10px; padding: 16px 20px; border-bottom: 1px solid #21262d; flex-wrap: wrap; }}
-  .cg-header .addr-full {{ font-family: ui-monospace, monospace; font-size: 0.875rem; word-break: break-all; }}
+  .cg-header .addr-full {{ font-family: "JetBrains Mono", monospace; font-size: 0.875rem; word-break: break-all; }}
   .cg-icon-btn {{ background: #161b22; border: 1px solid #30363d; color: #8b949e; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 0.8125rem; }}
   .cg-icon-btn:hover {{ color: #58a6ff; border-color: #58a6ff; }}
   .cg-body {{ padding: 16px 20px 24px; }}
@@ -2309,26 +2386,37 @@ def _build_report_html(
 </head>
 <body>
 <div class="wrap">
-  <h1>Perp 活躍高 ROI 帳號</h1>
-  <p class="sub">產生時間：{html.escape(generated)} · 點擊地址查看詳情</p>
-  <div class="meta-pills">
-    <span class="meta-pill">Hyperliquid API</span>
-    <span class="meta-pill">Info: {html.escape(info_hosts)}</span>
-    <span class="meta-pill">30D≥{MIN_FILLS_30D}筆</span>
-    <span class="meta-pill">帳齡≥{MIN_HISTORY_DAYS}D</span>
-    <span class="meta-pill">ROI&gt;{min_year_roi:.0%}</span>
-    <span class="meta-pill">最大回撤&lt;{MAX_PEAK_DRAWDOWN:.0%}</span>
-  </div>
+  <header class="hero">
+    <div class="brand">HYPE</div>
+    <h1>高 ROI 帳號共識</h1>
+    <p class="sub">產生時間 {html.escape(generated)} · 地址連至 CoinGlass</p>
+    <div class="hero-stats">
+      <div class="hero-stat"><span class="k">追蹤帳號</span><span class="v">{len(qualified)}</span></div>
+      <div class="hero-stat"><span class="k">24H 共識</span><span class="v accent">{consensus_24h}</span></div>
+      <div class="hero-stat"><span class="k">4H 共識</span><span class="v">{consensus_4h}</span></div>
+      <div class="hero-stat"><span class="k">72H 共識</span><span class="v">{consensus_72h}</span></div>
+    </div>
+  </header>
 
-  {summary_cards}
+  <details class="filters">
+    <summary>篩選條件</summary>
+    <div class="meta-pills">
+      <span class="meta-pill">Hyperliquid</span>
+      <span class="meta-pill">Info: {html.escape(info_hosts)}</span>
+      <span class="meta-pill">30D≥{MIN_FILLS_30D}筆</span>
+      <span class="meta-pill">帳齡≥{MIN_HISTORY_DAYS}D</span>
+      <span class="meta-pill">ROI&gt;{min_year_roi:.0%}</span>
+      <span class="meta-pill">最大回撤&lt;{MAX_PEAK_DRAWDOWN:.0%}</span>
+    </div>
+  </details>
 
   <div class="toolbar">
     <div class="tabs main-tabs">
       <button type="button" class="tab active" data-panel="consensus">共識</button>
       {positions_tab}
-      <button type="button" class="tab" data-panel="accounts">帳號排名</button>
+      <button type="button" class="tab" data-panel="accounts">帳號</button>
     </div>
-    <input id="search" type="search" placeholder="搜尋標的、地址...">
+    <input id="search" type="search" placeholder="搜尋標的或地址…" aria-label="搜尋">
   </div>
 
 {consensus_section}
@@ -2336,12 +2424,12 @@ def _build_report_html(
 {position_section}
 
   <div id="accounts" class="panel">
-    <p class="count" style="margin-bottom:8px">共 {len(qualified)} 個帳號 · 點地址前往 CoinGlass</p>
+    <p class="section-label">帳號排名 · {len(qualified)} · 點地址開 CoinGlass</p>
     <div class="table-wrap">
       <table class="sortable">
         <thead><tr>
-          <th>#</th><th>平台</th><th>地址</th><th>名稱</th><th class="num">ROI</th><th class="num">帳齡(D)</th>
-          <th class="num">帳戶價值</th><th class="num">日 PnL</th><th class="num">日 ROI</th><th class="num">日成交量</th><th class="num">週 ROI</th>
+          <th>#</th><th>平台</th><th>地址</th><th>名稱</th><th class="num">ROI</th><th class="num">帳齡</th>
+          <th class="num">帳戶價值</th><th class="num">日 PnL</th><th class="num">日 ROI</th><th class="num">日量</th><th class="num">週 ROI</th>
         </tr></thead>
         <tbody>{"".join(account_rows)}</tbody>
       </table>
@@ -2391,7 +2479,7 @@ def _build_report_html(
 
 <script>
 const PROFILES = {profiles_json};
-let activeWindowFilter = 'all';
+let activeWindowFilter = '24H';
 
 function activeViewRoot() {{
   const panel = document.querySelector('.panel.active');
@@ -2416,21 +2504,19 @@ function fmtTime(ms) {{
 
 function applyWindowFilter(filter) {{
   activeWindowFilter = filter;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === filter));
-  document.querySelectorAll('.consensus-window').forEach(block => {{
-    const w = block.dataset.window || '';
-    block.style.display = (filter === 'all' || w === filter) ? '' : 'none';
+  document.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === filter));
+  document.querySelectorAll('.window-board').forEach(block => {{
+    block.classList.toggle('active', block.dataset.window === filter);
   }});
   document.querySelectorAll('#trades-table tbody tr').forEach(row => {{
     const w = row.dataset.window || '';
-    row.style.display = (filter === 'all' || w === filter) ? '' : 'none';
+    row.style.display = (w === filter) ? '' : 'none';
   }});
 }}
 
 document.addEventListener('click', e => {{
   const t = e.target;
-  if (t.classList.contains('addr-btn')) openProfile(t.dataset.address);
-  if (t.classList.contains('filter-btn')) applyWindowFilter(t.dataset.filter);
+  if (t.classList.contains('seg-btn')) applyWindowFilter(t.dataset.filter);
 }});
 
 function openProfile(addr) {{
@@ -2489,7 +2575,7 @@ function openProfile(addr) {{
 function drawChart(points) {{
   const svg = document.getElementById('cg-chart');
   if (!points.length) {{ svg.innerHTML = '<text x="10" y="100" fill="#8b949e">無圖表資料</text>'; return; }}
-  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  const ys = points.map(p => p[1]);
   const minY = Math.min(...ys), maxY = Math.max(...ys);
   const pad = 8, w = 800, h = 190;
   const scaleX = i => pad + (i / (points.length - 1 || 1)) * (w - pad * 2);
@@ -2539,8 +2625,7 @@ document.querySelectorAll('#consensus .subtab').forEach(btn => {{
     root.querySelectorAll('.subtab').forEach(b => b.classList.remove('active'));
     root.querySelectorAll('.sub-panel').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
-    const panel = document.getElementById(btn.dataset.subpanel);
-    panel.classList.add('active');
+    document.getElementById(btn.dataset.subpanel).classList.add('active');
   }});
 }});
 
@@ -2548,9 +2633,13 @@ document.getElementById('search').addEventListener('input', e => {{
   const q = e.target.value.toLowerCase();
   const root = activeViewRoot();
   if (!root) return;
+  root.querySelectorAll('.coin-card, .coin-row').forEach(el => {{
+    el.style.display = el.textContent.toLowerCase().includes(q) ? '' : 'none';
+  }});
   root.querySelectorAll('tbody').forEach(tbody => {{
     tbody.querySelectorAll('tr').forEach(row => {{
-      row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+      const winOk = !row.dataset.window || row.dataset.window === activeWindowFilter;
+      row.style.display = (winOk && row.textContent.toLowerCase().includes(q)) ? '' : 'none';
     }});
   }});
 }});
